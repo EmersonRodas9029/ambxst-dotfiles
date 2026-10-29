@@ -1,0 +1,1825 @@
+diff --git a/modules/services/CompositorConfig.qml b/modules/services/CompositorConfig.qml
+index 86c0a9be..618d370e 100644
+--- a/modules/services/CompositorConfig.qml
++++ b/modules/services/CompositorConfig.qml
+@@ -13,6 +13,7 @@ QtObject {
+     property Process compositorProcess: Process {}
+ 
+     property var currentAnimationConfig: null
++    property int animationsRetries: 0
+     property Process readAnimationsProcess: Process {
+         command: ["axctl", "config", "get-animations"]
+         stdout: StdioCollector {
+@@ -22,14 +23,32 @@ QtObject {
+                     if (Array.isArray(parsed) && parsed.length > 0) {
+                         // axctl config get-animations returns [animations, beziers]
+                         currentAnimationConfig = parsed;
++                        root.animationsRetries = 0;
+                     }
+                 } catch (e) {
+-                    console.error("CompositorConfig: Error parsing animations:", e);
++                    // ponytail: carrera de arranque, no un config malo. AxctlService
++                    // lanza `axctl daemon` en paralelo y esta lectura sale antes de que
++                    // exista /tmp/axctl-$UID.sock, asi que el cliente devuelve el error
++                    // de conexion en vez de JSON. Reintentar es la respuesta; antes
++                    // quedaba un ERROR en el log y currentAnimationConfig en null hasta
++                    // el proximo reload. Mismo patron que daemonRestartTimer.
++                    if (root.animationsRetries < 5) {
++                        root.animationsRetries++;
++                        animationsRetryTimer.restart();
++                    } else {
++                        console.error("CompositorConfig: Error parsing animations:", e);
++                    }
+                 }
+             }
+         }
+     }
+ 
++    property Timer animationsRetryTimer: Timer {
++        interval: 1000
++        repeat: false
++        onTriggered: root.readAnimationsProcess.running = true
++    }
++
+     property var barInstances: []
+ 
+     function registerBar(barInstance) {
+diff --git a/modules/services/GlobalShortcuts.qml b/modules/services/GlobalShortcuts.qml
+index 0f8d2be8..f6ba0e5c 100644
+--- a/modules/services/GlobalShortcuts.qml
++++ b/modules/services/GlobalShortcuts.qml
+@@ -42,10 +42,14 @@ QtObject {
+             // Dashboard
+             case "dashboard": toggleDashboardTab(0); break;
+             case "wallpapers": toggleDashboardTab(1); break;
++            case "wallpaper-next": if (GlobalStates.wallpaperManager) GlobalStates.wallpaperManager.nextWallpaper(); break;
++            case "wallpaper-prev": if (GlobalStates.wallpaperManager) GlobalStates.wallpaperManager.previousWallpaper(); break;
+             case "assistant": toggleAssistant(); break;
+             case "dashboard-widgets": toggleDashboardTab(0); break;
+             case "dashboard-wallpapers": toggleDashboardTab(1); break;
+             case "dashboard-kanban": toggleDashboardTab(2); break;
++            case "dashboard-monitors": toggleDashboardTab(3); break;
++            case "dashboard-projection": toggleDashboardTab(4); break;
+             case "dashboard-assistant": toggleAssistant(); break;
+             case "dashboard-controls": toggleSettings(); break;
+ 
+diff --git a/modules/theme/Icons.qml b/modules/theme/Icons.qml
+index c6a690a5..d2d2c0d6 100644
+--- a/modules/theme/Icons.qml
++++ b/modules/theme/Icons.qml
+@@ -57,6 +57,8 @@ QtObject {
+     readonly property string hand: ""
+     readonly property string handGrab: ""
+     readonly property string heartbeat: ""
++    readonly property string monitor: ""
++    readonly property string laptop: "\ue586"
+     readonly property string cpu: ""
+     readonly property string gpu: ""
+     readonly property string ram: ""
+diff --git a/modules/widgets/dashboard/Dashboard.qml b/modules/widgets/dashboard/Dashboard.qml
+index 0c23fc72..268b6c80 100644
+--- a/modules/widgets/dashboard/Dashboard.qml
++++ b/modules/widgets/dashboard/Dashboard.qml
+@@ -11,10 +11,13 @@ import qs.modules.widgets.dashboard.widgets
+ import qs.modules.widgets.dashboard.controls
+ import qs.modules.widgets.dashboard.wallpapers
+ import qs.modules.widgets.dashboard.metrics
++import qs.modules.widgets.dashboard.monitors
++import qs.modules.widgets.dashboard.projection
+ import qs.config
+ 
+ NotchAnimationBehavior {
+     id: root
++    clip: true // ponytail: safety net so a too-narrow output crops instead of bleeding past the screen edge
+ 
+     property int leftPanelWidth
+ 
+@@ -22,7 +25,7 @@ NotchAnimationBehavior {
+         property int currentTab: GlobalStates.dashboardCurrentTab
+     }
+ 
+-    readonly property var tabModel: [Icons.widgets, Icons.wallpapers, Icons.heartbeat]
++    readonly property var tabModel: [Icons.widgets, Icons.wallpapers, Icons.heartbeat, Icons.monitor, Icons.squaresFour]
+     readonly property int tabCount: tabModel.length
+     readonly property int tabSpacing: 8
+ 
+@@ -189,7 +192,7 @@ NotchAnimationBehavior {
+ 
+                 // Calcular posición Y para un índice dado
+                 function getYForIndex(idx) {
+-                    if (idx <= 2) {
++                    if (idx < root.tabCount) {
+                         return idx * (width + root.tabSpacing);
+                     } else {
+                         // Controls button at the bottom
+@@ -447,13 +450,29 @@ NotchAnimationBehavior {
+                     sourceComponent: metricsComponent
+                     z: visible ? 1 : 0
+                 }
+-                
++
++                // Tab 3: Monitors
++                TabLoader {
++                    property int index: 3
++                    sourceComponent: monitorsComponent
++                    z: visible ? 1 : 0
++                }
++
++                // Tab 4: Projection (duplicar/extender/solo una pantalla)
++                TabLoader {
++                    property int index: 4
++                    sourceComponent: projectionComponent
++                    z: visible ? 1 : 0
++                }
++
+                 // Helper to access current item for focus
+                 property var currentItem: {
+                     switch(root.state.currentTab) {
+                         case 0: return children[0].item;
+                         case 1: return children[1].item;
+                         case 2: return children[2].item;
++                        case 3: return children[3].item;
++                        case 4: return children[4].item;
+                         default: return null;
+                     }
+                 }
+@@ -579,4 +598,14 @@ NotchAnimationBehavior {
+         id: wallpapersComponent
+         WallpapersTab {}
+     }
++
++    Component {
++        id: monitorsComponent
++        MonitorsTab {}
++    }
++
++    Component {
++        id: projectionComponent
++        ProjectionTab {}
++    }
+ }
+diff --git a/modules/widgets/dashboard/DashboardView.qml b/modules/widgets/dashboard/DashboardView.qml
+index b9add578..fd343310 100644
+--- a/modules/widgets/dashboard/DashboardView.qml
++++ b/modules/widgets/dashboard/DashboardView.qml
+@@ -1,10 +1,17 @@
+ import QtQuick
++import QtQuick.Window
+ import qs.modules.widgets.dashboard
+ import qs.modules.services
++import qs.modules.globals
+ 
+ Item {
+-    implicitWidth: 900
+-    implicitHeight: 56 + 48 * 6
++    readonly property int designWidth: 900
++    // ponytail: clamp to the actual output width instead of reflowing the widget grid;
++    // upgrade to a real portrait layout if narrow externals become the common case.
++    implicitWidth: Window.width > 0 ? Math.min(designWidth, Window.width - 24) : designWidth
++    // ponytail: los dos tabs propios piden mas alto que el resto — monitores por el
++    // mapa arriba de la ficha, proyeccion por las cuatro tarjetas de modo.
++    implicitHeight: GlobalStates.dashboardCurrentTab === 3 ? 500 : (GlobalStates.dashboardCurrentTab === 4 ? 440 : 56 + 48 * 6)
+ 
+     readonly property int leftPanelWidth: 270
+ 
+diff --git a/modules/widgets/dashboard/metrics/MetricsTab.qml b/modules/widgets/dashboard/metrics/MetricsTab.qml
+index 97b91b37..ba35a74b 100644
+--- a/modules/widgets/dashboard/metrics/MetricsTab.qml
++++ b/modules/widgets/dashboard/metrics/MetricsTab.qml
+@@ -22,6 +22,39 @@ Rectangle {
+     property var linuxLogos: null
+     property real chartZoom: 1.0
+ 
++    // --- identidad de las series sin depender del tono ---
++    // Con un wallpaper en blanco y negro matugen deja TODA la paleta en #ffffff, asi
++    // que red/cyan/green eran la misma linea blanca cinco veces. Cada serie lleva
++    // ademas grosor, opacidad y patron de guion propios: con color se suman al tono,
++    // sin color siguen distinguiendose. El glifo es la muestra que usa la leyenda.
++    readonly property var seriesStyles: [
++        { dash: [],              width: 2.0, alpha: 1.00, fill: true,  glyph: "━━" },
++        { dash: [6, 4],          width: 1.7, alpha: 0.85, fill: false, glyph: "╌╌" },
++        { dash: [1.5, 3.5],      width: 1.7, alpha: 0.68, fill: false, glyph: "┈┈" },
++        { dash: [7, 3, 1.5, 3],  width: 1.7, alpha: 0.55, fill: false, glyph: "╍╍" }
++    ]
++
++    // Fuente unica para el canvas y la leyenda: mismo orden, mismo estilo.
++    readonly property var chartSeries: {
++        const out = [
++            { name: "CPU", color: Colors.red, value: SystemResources.cpuUsage, history: SystemResources.cpuHistory },
++            { name: "RAM", color: Colors.cyan, value: SystemResources.ramUsage, history: SystemResources.ramHistory }
++        ];
++        if (SystemResources.gpuDetected) {
++            for (let i = 0; i < SystemResources.gpuCount && out.length < 4; i++) {
++                const vendor = (SystemResources.gpuVendors[i] || "").toLowerCase();
++                const color = vendor === "nvidia" ? Colors.green : (vendor === "amd" ? Colors.red : (vendor === "intel" ? Colors.blue : Colors.magenta));
++                out.push({
++                    name: SystemResources.gpuCount > 1 ? `GPU ${i + 1}` : "GPU",
++                    color: color,
++                    value: SystemResources.gpuUsages[i] || 0,
++                    history: SystemResources.gpuHistories[i] || []
++                });
++            }
++        }
++        return out;
++    }
++
+     // Adjust history points based on zoom and repaint chart
+     onChartZoomChanged: {
+         // Store enough history to support zoom out
+@@ -340,8 +373,12 @@ Rectangle {
+                     Text {
+                         text: "System"
+                         font.family: Config.theme.font
+-                        font.pixelSize: Styling.fontSize(-2)
+-                        color: Colors.overBackground
++                        font.pixelSize: Styling.fontSize(-4)
++                        font.weight: Font.DemiBold
++                        font.letterSpacing: 1.4
++                        font.capitalization: Font.AllUppercase
++                        color: Colors.overSurfaceVariant
++                        opacity: 0.55
+                     }
+ 
+                     Separator {
+@@ -378,7 +415,8 @@ Rectangle {
+                             }
+ 
+                             RowLayout {
+-                                width: parent.width
++                                // la columna de % se mudo al ResourceItem de arriba: hay que dejarle su ancho (42+8) o la temperatura se corta
++                                width: parent.width - 50
+                                 spacing: 4
+ 
+                                 Text {
+@@ -394,14 +432,6 @@ Rectangle {
+                                     Layout.fillWidth: true
+                                 }
+ 
+-                                Text {
+-                                    text: `${Math.round(SystemResources.cpuUsage)}%`
+-                                    font.family: Config.theme.font
+-                                    font.pixelSize: Styling.fontSize(-2)
+-                                    font.weight: Font.Medium
+-                                    color: Colors.overBackground
+-                                }
+-
+                                 Text {
+                                     visible: SystemResources.cpuTemp >= 0
+                                     text: Icons.temperature
+@@ -413,7 +443,7 @@ Rectangle {
+                                 Text {
+                                     visible: SystemResources.cpuTemp >= 0
+                                     text: `${SystemResources.cpuTemp}°`
+-                                    font.family: Config.theme.font
++                                    font.family: Config.theme.monoFont
+                                     font.pixelSize: Styling.fontSize(-2)
+                                     font.weight: Font.Medium
+                                     color: Colors.overBackground
+@@ -435,7 +465,8 @@ Rectangle {
+                             }
+ 
+                             RowLayout {
+-                                width: parent.width
++                                // la columna de % se mudo al ResourceItem de arriba: hay que dejarle su ancho (42+8) o la temperatura se corta
++                                width: parent.width - 50
+                                 spacing: 4
+ 
+                                 Text {
+@@ -444,8 +475,8 @@ Rectangle {
+                                         const totalGB = (SystemResources.ramTotal / 1024 / 1024).toFixed(1);
+                                         return `${usedGB} GB / ${totalGB} GB`;
+                                     }
+-                                    font.family: Config.theme.font
+-                                    font.pixelSize: Styling.fontSize(-2)
++                                    font.family: Config.theme.monoFont
++                                    font.pixelSize: Styling.monoFontSize(-3)
+                                     color: Colors.overBackground
+                                     elide: Text.ElideMiddle
+                                 }
+@@ -454,14 +485,6 @@ Rectangle {
+                                     Layout.preferredHeight: 2
+                                     Layout.fillWidth: true
+                                 }
+-
+-                                Text {
+-                                    text: `${Math.round(SystemResources.ramUsage)}%`
+-                                    font.family: Config.theme.font
+-                                    font.pixelSize: Styling.fontSize(-2)
+-                                    font.weight: Font.Medium
+-                                    color: Colors.overBackground
+-                                }
+                             }
+                         }
+ 
+@@ -507,7 +530,8 @@ Rectangle {
+                                 }
+ 
+                                 RowLayout {
+-                                    width: parent.width
++                                    // la columna de % se mudo al ResourceItem de arriba: hay que dejarle su ancho (42+8) o la temperatura se corta
++                                    width: parent.width - 50
+                                     spacing: 4
+ 
+                                     Text {
+@@ -518,6 +542,10 @@ Rectangle {
+                                         font.family: Config.theme.font
+                                         font.pixelSize: Styling.fontSize(-2)
+                                         color: Colors.overBackground
++                                        // sin fillWidth el elide nunca entra: el nombre
++                                        // largo ("NVIDIA GeForce RTX 3050 Laptop GPU")
++                                        // empujaba la temperatura fuera de la fila.
++                                        Layout.fillWidth: true
+                                         elide: Text.ElideMiddle
+                                     }
+ 
+@@ -526,14 +554,6 @@ Rectangle {
+                                         Layout.fillWidth: true
+                                     }
+ 
+-                                    Text {
+-                                        text: `${Math.round(SystemResources.gpuUsages[index] || 0)}%`
+-                                        font.family: Config.theme.font
+-                                        font.pixelSize: Styling.fontSize(-2)
+-                                        font.weight: Font.Medium
+-                                        color: Colors.overBackground
+-                                    }
+-
+                                     Text {
+                                         visible: (SystemResources.gpuTemps[index] ?? -1) >= 0
+                                         text: Icons.temperature
+@@ -557,7 +577,7 @@ Rectangle {
+                                     Text {
+                                         visible: (SystemResources.gpuTemps[index] ?? -1) >= 0
+                                         text: `${SystemResources.gpuTemps[index]}°`
+-                                        font.family: Config.theme.font
++                                        font.family: Config.theme.monoFont
+                                         font.pixelSize: Styling.fontSize(-2)
+                                         font.weight: Font.Medium
+                                         color: Colors.overBackground
+@@ -595,7 +615,8 @@ Rectangle {
+                                 }
+ 
+                                 RowLayout {
+-                                    width: parent.width
++                                    // la columna de % se mudo al ResourceItem de arriba: hay que dejarle su ancho (42+8) o la temperatura se corta
++                                    width: parent.width - 50
+                                     spacing: 4
+ 
+                                     Text {
+@@ -603,6 +624,10 @@ Rectangle {
+                                         font.family: Config.theme.font
+                                         font.pixelSize: Styling.fontSize(-2)
+                                         color: Colors.overBackground
++                                        // sin fillWidth el elide nunca entra: el nombre
++                                        // largo ("NVIDIA GeForce RTX 3050 Laptop GPU")
++                                        // empujaba la temperatura fuera de la fila.
++                                        Layout.fillWidth: true
+                                         elide: Text.ElideMiddle
+                                     }
+ 
+@@ -610,14 +635,6 @@ Rectangle {
+                                         Layout.preferredHeight: 2
+                                         Layout.fillWidth: true
+                                     }
+-
+-                                    Text {
+-                                        text: `${Math.round((SystemResources.diskUsage[modelData] || 0))}%`
+-                                        font.family: Config.theme.font
+-                                        font.pixelSize: Styling.fontSize(-2)
+-                                        font.weight: Font.Medium
+-                                        color: Colors.overBackground
+-                                    }
+                                 }
+                             }
+                         }
+@@ -632,6 +649,58 @@ Rectangle {
+             Layout.fillHeight: true
+             spacing: 8
+ 
++            // Leyenda: la identidad de cada serie NO puede depender del color (en
++            // monocromo son todas blancas), asi que va la muestra del patron + el
++            // nombre + el valor en vivo. De paso evita bajar la vista a la columna
++            // izquierda para saber en cuanto va cada cosa.
++            RowLayout {
++                Layout.fillWidth: true
++                Layout.leftMargin: 4
++                spacing: 16
++
++                Repeater {
++                    model: root.chartSeries
++
++                    RowLayout {
++                        required property var modelData
++                        required property int index
++                        readonly property var style: root.seriesStyles[Math.min(index, root.seriesStyles.length - 1)]
++                        spacing: 6
++
++                        Text {
++                            text: parent.style.glyph
++                            font.family: Config.theme.monoFont
++                            font.pixelSize: Styling.monoFontSize(-2)
++                            color: parent.modelData.color
++                            opacity: parent.style.alpha
++                        }
++
++                        Text {
++                            text: parent.modelData.name
++                            font.family: Config.theme.font
++                            font.pixelSize: Styling.fontSize(-4)
++                            font.weight: Font.DemiBold
++                            font.letterSpacing: 1.2
++                            font.capitalization: Font.AllUppercase
++                            color: Colors.overSurfaceVariant
++                            opacity: 0.6
++                        }
++
++                        Text {
++                            text: `${Math.round(parent.modelData.value)}%`
++                            font.family: Config.theme.monoFont
++                            font.pixelSize: Styling.monoFontSize(-2)
++                            font.weight: Font.Medium
++                            color: Colors.overBackground
++                        }
++                    }
++                }
++
++                Item {
++                    Layout.fillWidth: true
++                }
++            }
++
+             StyledRect {
+                 Layout.fillWidth: true
+                 Layout.fillHeight: true
+@@ -673,22 +742,25 @@ Rectangle {
+                             const graphOffset = w - ((actualPoints - 1) * pointSpacing);
+ 
+                             // === GRID RENDERING ===
+-                            // Grid now uses the SAME coordinate system as the data
+-                            ctx.strokeStyle = Colors.surface;
++                            // La grilla usaba Colors.surface (#131313): invisible sobre
++                            // el fondo negro del tema OLED. Ahora sale de `outline` con
++                            // alpha, que es recesiva a proposito pero existe. La linea
++                            // del 50% va mas marcada: es la referencia que uno busca.
++                            const gridInk = Colors.outline;
+                             ctx.lineWidth = 1;
+ 
+-                            // Horizontal grid lines (percentage-based, fixed at 8 divisions)
+                             for (let i = 1; i < 8; i++) {
+                                 const y = h * (i / 8);
++                                ctx.strokeStyle = Qt.rgba(gridInk.r, gridInk.g, gridInk.b, i === 4 ? 0.22 : 0.10);
+                                 ctx.beginPath();
+-                                ctx.moveTo(0, y);
+-                                ctx.lineTo(w, y);
++                                ctx.moveTo(0, y + 0.5);
++                                ctx.lineTo(w, y + 0.5);
+                                 ctx.stroke();
+                             }
+ 
+                             // Vertical grid lines every 10 points
+-                            ctx.strokeStyle = Colors.surface;
+-                            ctx.lineWidth = 2;
++                            ctx.strokeStyle = Qt.rgba(gridInk.r, gridInk.g, gridInk.b, 0.07);
++                            ctx.lineWidth = 1;
+ 
+                             // Use the absolute data point counter for infinite scrolling
+                             const totalDataPoints = SystemResources.totalDataPoints;
+@@ -717,7 +789,7 @@ Rectangle {
+ 
+                             // === DATA RENDERING ===
+                             // Helper function to draw a line chart with gradient fill
+-                            function drawLine(history, color) {
++                            function drawLine(history, color, style) {
+                                 if (history.length < 2)
+                                     return;
+ 
+@@ -728,10 +800,12 @@ Rectangle {
+                                 // Use same offset as grid for perfect alignment
+                                 const dataOffset = graphOffset;
+ 
+-                                // Create gradient from top to bottom
++                                // Solo la serie principal lleva relleno: cuatro areas
++                                // translucidas encimadas se suman y tapan las lineas.
++                                if (style.fill) {
+                                 const gradient = ctx.createLinearGradient(0, 0, 0, h);
+-                                gradient.addColorStop(0, Qt.rgba(color.r, color.g, color.b, 0.4));
+-                                gradient.addColorStop(0.5, Qt.rgba(color.r, color.g, color.b, 0.2));
++                                gradient.addColorStop(0, Qt.rgba(color.r, color.g, color.b, 0.28));
++                                gradient.addColorStop(0.5, Qt.rgba(color.r, color.g, color.b, 0.12));
+                                 gradient.addColorStop(1, Qt.rgba(color.r, color.g, color.b, 0.0));
+ 
+                                 // Draw filled area
+@@ -758,12 +832,14 @@ Rectangle {
+                                 ctx.lineTo(lastX, h);
+                                 ctx.closePath();
+                                 ctx.fill();
++                                }
+ 
+                                 // Draw the line on top
+-                                ctx.strokeStyle = color;
+-                                ctx.lineWidth = 2;
+-                                ctx.lineCap = "round";
++                                ctx.strokeStyle = Qt.rgba(color.r, color.g, color.b, style.alpha);
++                                ctx.lineWidth = style.width;
++                                ctx.lineCap = style.dash.length ? "butt" : "round";
+                                 ctx.lineJoin = "round";
++                                ctx.setLineDash(style.dash);
+                                 ctx.beginPath();
+ 
+                                 for (let i = 0; i < recentHistory.length; i++) {
+@@ -778,41 +854,39 @@ Rectangle {
+                                 }
+ 
+                                 ctx.stroke();
++                                ctx.setLineDash([]);
+                             }
+ 
+-                            // Draw CPU line (red)
+-                            drawLine(SystemResources.cpuHistory, Colors.red);
+-
+-                            // Draw RAM line (cyan)
+-                            drawLine(SystemResources.ramHistory, Colors.cyan);
+-
+-                            // Draw GPU lines (color based on vendor)
+-                            if (SystemResources.gpuDetected && SystemResources.gpuCount > 0) {
+-                                for (let i = 0; i < SystemResources.gpuCount; i++) {
+-                                    if (SystemResources.gpuHistories[i] && SystemResources.gpuHistories[i].length > 0) {
+-                                        // Get vendor-specific color
+-                                        const vendor = SystemResources.gpuVendors[i] || "";
+-                                        let color;
+-                                        switch (vendor.toLowerCase()) {
+-                                        case "nvidia":
+-                                            color = Colors.green;
+-                                            break;
+-                                        case "amd":
+-                                            color = Colors.red;
+-                                            break;
+-                                        case "intel":
+-                                            color = Colors.blue;
+-                                            break;
+-                                        default:
+-                                            color = Colors.magenta;
+-                                            break;
+-                                        }
+-                                        drawLine(SystemResources.gpuHistories[i], color);
+-                                    }
+-                                }
+-                            }
++                            // Escala: sin ella el grafico no dice si una linea baja es
++                            // 5% o 40%. Tres marcas bastan, en mono y bien recesivas.
++                            ctx.font = `9px "${Config.theme.monoFont}"`;
++                            ctx.fillStyle = Qt.rgba(gridInk.r, gridInk.g, gridInk.b, 0.65);
++                            ctx.textBaseline = "middle";
++                            ctx.fillText("100", 4, 8);
++                            ctx.fillText(" 50", 4, h / 2);
++                            ctx.fillText("  0", 4, h - 8);
++
++                            // Las series y su estilo salen de root.chartSeries: mismo
++                            // orden y mismo patron que la leyenda de arriba.
++                            const series = root.chartSeries;
++                            for (let i = 0; i < series.length; i++)
++                                drawLine(series[i].history, series[i].color, root.seriesStyles[Math.min(i, root.seriesStyles.length - 1)]);
+                         }
+                     }
++
++                    // El grafico se dibuja alineado a la derecha, asi que al arrancar
++                    // (o tras recargar ambxst) hay 2 puntos contra el borde y el resto
++                    // es negro: parecia roto. Esto dice que se esta llenando.
++                    Text {
++                        anchors.centerIn: parent
++                        visible: SystemResources.cpuHistory.length < 8
++                        text: `RECOLECTANDO · ${SystemResources.cpuHistory.length}/50`
++                        font.family: Config.theme.monoFont
++                        font.pixelSize: Styling.monoFontSize(-2)
++                        font.letterSpacing: 1.4
++                        color: Colors.overSurfaceVariant
++                        opacity: 0.45
++                    }
+                 }
+             }
+ 
+diff --git a/modules/widgets/dashboard/metrics/ResourceItem.qml b/modules/widgets/dashboard/metrics/ResourceItem.qml
+index cd6f1782..1168b386 100644
+--- a/modules/widgets/dashboard/metrics/ResourceItem.qml
++++ b/modules/widgets/dashboard/metrics/ResourceItem.qml
+@@ -22,30 +22,29 @@ Item {
+         Text {
+             text: root.icon
+             font.family: Icons.font
+-            font.pixelSize: 18
++            font.pixelSize: 16
+             color: Colors.overBackground
+             Layout.alignment: Qt.AlignVCenter
+             Layout.preferredWidth: 20
+         }
+ 
+-        // Progress bar
++        // Barra. Antes era una pastilla de 16px con borde de 2px del color de la
++        // serie: en monocromo ese borde blanco pesaba mas que el dato y las cuatro
++        // filas se leian como botones. Ahora es un riel hairline con relleno solido.
+         Rectangle {
+             Layout.fillWidth: true
+-            Layout.preferredHeight: 16
++            Layout.preferredHeight: 8
+             Layout.alignment: Qt.AlignVCenter
+-            radius: Styling.radius(0)
+-            color: Colors.surface
+-            border.width: 2
+-            border.color: root.barColor
++            radius: height / 2
++            color: Qt.rgba(Colors.outline.r, Colors.outline.g, Colors.outline.b, 0.18)
+ 
+             Rectangle {
+-                width: (parent.width - 8) * Math.max(0, Math.min(1, root.value))
+-                height: parent.height - 8
++                width: parent.width * Math.max(0, Math.min(1, root.value))
++                height: parent.height
+                 radius: parent.radius
+                 color: root.barColor
+                 anchors.verticalCenter: parent.verticalCenter
+                 anchors.left: parent.left
+-                anchors.leftMargin: 4
+ 
+                 Behavior on width {
+                     enabled: Config.animDuration > 0
+@@ -57,16 +56,16 @@ Item {
+             }
+         }
+ 
+-        // Percentage text
++        // El porcentaje vive aqui y no en la fila de abajo: asi los cuatro quedan en
++        // una sola columna a la derecha, en mono, y se comparan de un vistazo.
+         Text {
+-            visible: false
+             text: `${Math.round(root.value * 100)}%`
+-            font.family: Config.theme.font
+-            font.pixelSize: Config.theme.fontSize
++            font.family: Config.theme.monoFont
++            font.pixelSize: Styling.monoFontSize(-2)
+             font.weight: Font.Medium
+-            color: Colors.overSurfaceVariant
++            color: Colors.overBackground
+             Layout.alignment: Qt.AlignVCenter
+-            Layout.preferredWidth: 35
++            Layout.preferredWidth: 42
+             horizontalAlignment: Text.AlignRight
+         }
+     }
+diff --git a/modules/widgets/dashboard/wallpapers/FilterBar.qml b/modules/widgets/dashboard/wallpapers/FilterBar.qml
+index eec82f0a..90e8904e 100644
+--- a/modules/widgets/dashboard/wallpapers/FilterBar.qml
++++ b/modules/widgets/dashboard/wallpapers/FilterBar.qml
+@@ -159,7 +159,7 @@ FocusScope {
+         ListModel {
+             id: filterModel
+             ListElement {
+-                label: "Images"
++                label: "IMG"
+                 type: "image"
+             }
+             ListElement {
+@@ -167,7 +167,7 @@ FocusScope {
+                 type: "gif"
+             }
+             ListElement {
+-                label: "Videos"
++                label: "VID"
+                 type: "video"
+             }
+         }
+@@ -291,6 +291,8 @@ FocusScope {
+                             Text {
+                                 id: filterText
+                                 text: label
++                                font.letterSpacing: 1.1
++                                font.capitalization: Font.AllUppercase
+                                 font.family: Config.theme.font
+                                 font.pixelSize: Config.theme.fontSize
+                                 color: filterTag.item
+@@ -354,18 +356,20 @@ FocusScope {
+         position: flickable.contentX / flickable.contentWidth
+         size: flickable.width / flickable.contentWidth
+ 
++        // Recesiva: en blanco puro era lo mas brillante de toda la fila superior,
++        // mas que los chips que indica. Una barra de scroll se mira cuando se busca.
+         background: Rectangle {
+-            implicitWidth: 4
+-            implicitHeight: 4
+-            color: Colors.surface
+-            radius: Styling.radius(0)
++            implicitWidth: 3
++            implicitHeight: 3
++            color: Qt.rgba(Colors.outline.r, Colors.outline.g, Colors.outline.b, 0.14)
++            radius: height / 2
+         }
+ 
+         contentItem: Rectangle {
+-            implicitWidth: 4
+-            implicitHeight: 4
+-            color: Styling.srItem("overprimary")
+-            radius: Styling.radius(0)
++            implicitWidth: 3
++            implicitHeight: 3
++            color: Qt.rgba(Colors.overBackground.r, Colors.overBackground.g, Colors.overBackground.b, scrollBar.hovered || scrollBar.pressed ? 0.75 : 0.35)
++            radius: height / 2
+         }
+ 
+         onPressedChanged: {
+diff --git a/modules/widgets/dashboard/wallpapers/Wallpaper.qml b/modules/widgets/dashboard/wallpapers/Wallpaper.qml
+index 852359ef..32002e40 100644
+--- a/modules/widgets/dashboard/wallpapers/Wallpaper.qml
++++ b/modules/widgets/dashboard/wallpapers/Wallpaper.qml
+@@ -281,6 +281,39 @@ PanelWindow {
+     // Matugen se ejecuta manualmente en las funciones de cambio
+     {}
+ 
++    // Aplica el fondo global del indice dado. Unico sitio que aplica un fondo
++    // nuevo: setWallpaper, setWallpaperByIndex, nextWallpaper y
++    // previousWallpaper repetian estas cinco lineas cada una. (El bootstrap de
++    // wallpaperPaths tambien escribe currentWall, pero solo si esta vacio y
++    // dejando que onCurrentWallChanged dispare matugen.)
++    //
++    // Si el indice ya es el fondo puesto solo sincroniza currentIndex: relanzar
++    // matugen, el frame del lockscreen y mpvpaper por nada cortaba el video.
++    function applyWallpaperIndex(index) {
++        if (index < 0 || index >= wallpaperPaths.length) {
++            return;
++        }
++
++        const path = wallpaperPaths[index];
++
++        // OJO con el orden: currentWallpaper es un binding sobre currentIndex
++        // (ver su declaracion arriba), asi que hay que comparar ANTES de tocar
++        // el indice. Si no, el binding ya movio currentWallpaper al path nuevo
++        // y la comparacion se cumple siempre, saltandose matugen y el guardado.
++        const yaEstaPuesto = (path === currentWallpaper);
++
++        initialLoadCompleted = true;
++        currentIndex = index;
++        if (yaEstaPuesto) {
++            return;
++        }
++
++        currentWallpaper = path;
++        wallpaperConfig.adapter.currentWall = path;
++        runMatugenForCurrentWallpaper();
++        generateLockscreenFrame(path);
++    }
++
+     function setWallpaper(path, targetScreen = null) {
+         if (GlobalStates.wallpaperManager && GlobalStates.wallpaperManager !== wallpaper) {
+             GlobalStates.wallpaperManager.setWallpaper(path, targetScreen);
+@@ -305,19 +338,14 @@ PanelWindow {
+                 }
+ 
+                 if (isPrimary || !wallpaperConfig.adapter.currentWall) {
+-                    currentIndex = pathIndex;
+-                    wallpaperConfig.adapter.currentWall = path;
+-                    currentWallpaper = path;
+-                    runMatugenForCurrentWallpaper();
++                    applyWallpaperIndex(pathIndex);
+                 }
++                // La rama por-pantalla regenera el frame siempre: togglePerScreenMode()
++                // aplica el mismo path a proposito y el helper se lo salta.
++                generateLockscreenFrame(path);
+             } else {
+-                // Global fallback target
+-                currentIndex = pathIndex;
+-                wallpaperConfig.adapter.currentWall = path;
+-                currentWallpaper = path;
+-                runMatugenForCurrentWallpaper();
++                applyWallpaperIndex(pathIndex);
+             }
+-            generateLockscreenFrame(path);
+         } else {
+             console.warn("Wallpaper path not found in current list:", path);
+         }
+@@ -337,6 +365,15 @@ PanelWindow {
+         }
+     }
+ 
++    // currentIndex se desincroniza de currentWallpaper (p.ej. al recargar con un
++    // currentWall viejo en el json), y entonces next/prev calculaban el indice
++    // del fondo que YA estaba puesto: con la guarda de applyWallpaperIndex eso
++    // se traducia en que la tecla no hacia nada. La verdad esta en el path.
++    function currentWallpaperIndex() {
++        const i = wallpaperPaths.indexOf(currentWallpaper);
++        return i >= 0 ? i : currentIndex;
++    }
++
+     function nextWallpaper() {
+         if (GlobalStates.wallpaperManager && GlobalStates.wallpaperManager !== wallpaper) {
+             GlobalStates.wallpaperManager.nextWallpaper();
+@@ -345,12 +382,7 @@ PanelWindow {
+ 
+         if (wallpaperPaths.length === 0)
+             return;
+-        initialLoadCompleted = true;
+-        currentIndex = (currentIndex + 1) % wallpaperPaths.length;
+-        currentWallpaper = wallpaperPaths[currentIndex];
+-        wallpaperConfig.adapter.currentWall = wallpaperPaths[currentIndex];
+-        runMatugenForCurrentWallpaper();
+-        generateLockscreenFrame(wallpaperPaths[currentIndex]);
++        applyWallpaperIndex((currentWallpaperIndex() + 1) % wallpaperPaths.length);
+     }
+ 
+     function previousWallpaper() {
+@@ -361,12 +393,7 @@ PanelWindow {
+ 
+         if (wallpaperPaths.length === 0)
+             return;
+-        initialLoadCompleted = true;
+-        currentIndex = currentIndex === 0 ? wallpaperPaths.length - 1 : currentIndex - 1;
+-        currentWallpaper = wallpaperPaths[currentIndex];
+-        wallpaperConfig.adapter.currentWall = wallpaperPaths[currentIndex];
+-        runMatugenForCurrentWallpaper();
+-        generateLockscreenFrame(wallpaperPaths[currentIndex]);
++        applyWallpaperIndex((currentWallpaperIndex() - 1 + wallpaperPaths.length) % wallpaperPaths.length);
+     }
+ 
+     function setWallpaperByIndex(index) {
+@@ -375,14 +402,7 @@ PanelWindow {
+             return;
+         }
+ 
+-        if (index >= 0 && index < wallpaperPaths.length) {
+-            initialLoadCompleted = true;
+-            currentIndex = index;
+-            currentWallpaper = wallpaperPaths[currentIndex];
+-            wallpaperConfig.adapter.currentWall = wallpaperPaths[currentIndex];
+-            runMatugenForCurrentWallpaper();
+-            generateLockscreenFrame(wallpaperPaths[currentIndex]);
+-        }
++        applyWallpaperIndex(index);
+     }
+ 
+     // Función para re-ejecutar Matugen con el wallpaper actual
+@@ -423,7 +443,8 @@ PanelWindow {
+             }
+ 
+             // Ejecutar matugen con configuración específica
+-            var commandWithConfig = ["matugen", "image", matugenSource, "--source-color-index", "0", "-c", decodeURIComponent(Qt.resolvedUrl("../../../../assets/matugen/config.toml").toString().replace("file://", "")), "-t", wallpaperConfig.adapter.matugenScheme];
++            var colorScript = decodeURIComponent(Qt.resolvedUrl("../../../../scripts/matugen-wallpaper.sh").toString().replace("file://", ""));
++            var commandWithConfig = [colorScript, matugenSource, "-c", decodeURIComponent(Qt.resolvedUrl("../../../../assets/matugen/config.toml").toString().replace("file://", "")), "-t", wallpaperConfig.adapter.matugenScheme];
+             if (Config.theme.lightMode) {
+                 commandWithConfig.push("-m", "light");
+             }
+@@ -431,7 +452,7 @@ PanelWindow {
+             matugenProcessWithConfig.running = true;
+ 
+             // Ejecutar matugen normal en paralelo
+-            var commandNormal = ["matugen", "image", matugenSource, "--source-color-index", "0", "-t", wallpaperConfig.adapter.matugenScheme];
++            var commandNormal = [colorScript, matugenSource, "-t", wallpaperConfig.adapter.matugenScheme];
+             if (Config.theme.lightMode) {
+                 commandNormal.push("-m", "light");
+             }
+@@ -440,24 +461,23 @@ PanelWindow {
+         }
+     }
+ 
++    // socat no esta instalado en este sistema: los `echo | socat` de antes salian
++    // con 127 y fallaban en silencio. mpv-ipc.py hace lo mismo con la stdlib y
++    // acepta globs para hablarle a todas las pantallas de una.
++    readonly property string mpvIpcScript: decodeURIComponent(Qt.resolvedUrl("../../../../scripts/mpv-ipc.py").toString().replace("file://", ""))
++
++    function mpvIpcCommand(jsonCmd, socketPath) {
++        return ["python3", mpvIpcScript, jsonCmd, socketPath];
++    }
++
+     function updateMpvRuntime(enable) {
+-        var cmdString;
+-        if (enable) {
+-            // Since we are using unique filenames, we can just set the new path.
+-            // MPV will handle the switch smoothly and won't use cached versions.
+-            var setCmd = JSON.stringify({
+-                "command": ["set_property", "glsl-shaders", mpvShaderPath]
+-            });
+-            cmdString = "echo '" + setCmd + "' | socat - " + mpvSocket;
+-        } else {
+-            // Clear shaders
+-            var jsonCmd = JSON.stringify({
+-                "command": ["set_property", "glsl-shaders", ""]
+-            });
+-            cmdString = "echo '" + jsonCmd + "' | socat - " + mpvSocket;
+-        }
++        // Con nombres de archivo unicos basta con fijar la ruta nueva: mpv hace
++        // el cambio solo y no reusa la cacheada.
++        var jsonCmd = JSON.stringify({
++            "command": ["set_property", "glsl-shaders", enable ? mpvShaderPath : ""]
++        });
+ 
+-        mpvIpcProcess.command = ["bash", "-c", cmdString];
++        mpvIpcProcess.command = mpvIpcCommand(jsonCmd, mpvSocket);
+         mpvIpcProcess.running = true;
+     }
+ 
+@@ -484,10 +504,56 @@ PanelWindow {
+     Process {
+         id: mpvSyncProcess
+         running: false
+-        command: ["bash", "-c", "for sock in /tmp/ambxst_mpv_socket_*; do echo '{ \"command\": [\"set_property\", \"time-pos\", 0] }' | socat - \"$sock\" 2>/dev/null; done"]
++        command: wallpaper.mpvIpcCommand('{"command":["set_property","time-pos",0]}', "/tmp/ambxst_mpv_socket_*")
+         onExited: code => {
+             console.log("Video sync broadcast completed with code:", code);
++            // mpvpaper arranca reproduciendo: si ya estabamos en fullscreen, repausar
++            wallpaper.setMpvPaused(wallpaper.windowOverWallpaper);
++        }
++    }
++
++    // Pausa el video mientras haya una ventana enfocada encima del fondo: un
++    // fondo animado 4K60 costaba 31% de CPU y dejaba la iGPU clavada a 1200 MHz,
++    // y en un WM de mosaico el fondo se ve solo cuando no hay ventanas.
++    //
++    // Mirar fullscreen/maximized no alcanzaba: dos kitty en mosaico tapan la
++    // pantalla sin que ninguna este maximizada, y los juegos en borderless
++    // tampoco piden fullscreen. Una ventana enfocada cubre los tres casos.
++    //
++    // ponytail: una ventana flotante chica cuenta igual como "tapando". Si
++    // molesta, hay que comparar su geometria con la del monitor (via axctl).
++    readonly property bool windowOverWallpaper: {
++        const toplevel = ToplevelManager.activeToplevel;
++        return !!toplevel && toplevel.activated === true;
++    }
++
++    // Debounce: al cambiar de ventana el toplevel viejo se desactiva antes de
++    // que el nuevo se active, asi que un simple cambio de foco disparaba un
++    // reanudar + pausar (dos procesos) por cada salto entre ventanas.
++    onWindowOverWallpaperChanged: pauseDebounce.restart()
++
++    Timer {
++        id: pauseDebounce
++        interval: 250
++        onTriggered: wallpaper.setMpvPaused(wallpaper.windowOverWallpaper)
++    }
++
++    function setMpvPaused(paused) {
++        if (getFileType(effectiveWallpaper) !== "video") {
++            return;
+         }
++        const toplevel = ToplevelManager.activeToplevel;
++        console.log("Wallpaper", paused ? "pausado" : "reanudado", "(ventana:", toplevel ? toplevel.appId : "-", "activada:", toplevel ? toplevel.activated : "-", "fullscreen:", toplevel ? toplevel.fullscreen : "-", "maximized:", (toplevel ? toplevel.maximized : "-") + ")");
++        mpvPauseProcess.running = false;
++        mpvPauseProcess.command = mpvIpcCommand(JSON.stringify({
++            "command": ["set_property", "pause", paused]
++        }), mpvSocket);
++        mpvPauseProcess.running = true;
++    }
++
++    Process {
++        id: mpvPauseProcess
++        running: false
+     }
+ 
+     function updateMpvShader() {
+@@ -648,14 +714,17 @@ PanelWindow {
+         }
+     }
+ 
+-    Component.onCompleted: {
+-        // Only the first Wallpaper instance should manage scanning
+-        // Other instances (for other screens) share the same data via GlobalStates
+-        if (GlobalStates.wallpaperManager !== null) {
+-            // Another instance already registered, skip initialization
+-            _wallpaperDirInitialized = true;
++    property bool _destroying: false
++
++    // Un monitor que se apaga o se vuelve mirror (duplicar/solo-externa/solo-portatil
++    // en el tab de Proyeccion) desaparece de Quickshell.screens, y Variants destruye
++    // su Wallpaper. Si ese era el lider, GlobalStates.wallpaperManager quedaba
++    // apuntando a un objeto destruido y el tab de Fondos se moria para toda la sesion
++    // (nadie mas podia reclamar el liderazgo). claimLeadership() + onDestruction +
++    // la Connections de abajo le pasan la batuta a otra pantalla viva.
++    function claimLeadership() {
++        if (GlobalStates.wallpaperManager !== null)
+             return;
+-        }
+ 
+         GlobalStates.wallpaperManager = wallpaper;
+ 
+@@ -682,6 +751,34 @@ PanelWindow {
+         });
+     }
+ 
++    Component.onCompleted: {
++        // Only the first Wallpaper instance should manage scanning
++        // Other instances (for other screens) share the same data via GlobalStates
++        if (GlobalStates.wallpaperManager !== null) {
++            // Another instance already registered, skip initialization
++            _wallpaperDirInitialized = true;
++            return;
++        }
++
++        claimLeadership();
++    }
++
++    Component.onDestruction: {
++        _destroying = true;
++        if (GlobalStates.wallpaperManager === wallpaper) {
++            GlobalStates.wallpaperManager = null;
++        }
++    }
++
++    Connections {
++        target: GlobalStates
++        function onWallpaperManagerChanged() {
++            if (!wallpaper._destroying && GlobalStates.wallpaperManager === null) {
++                wallpaper.claimLeadership();
++            }
++        }
++    }
++
+     FileView {
+         id: wallpaperConfig
+         // QUICKSHELL-GIT: path: Quickshell.cachePath("wallpapers.json")
+diff --git a/modules/widgets/dashboard/wallpapers/WallpapersTab.qml b/modules/widgets/dashboard/wallpapers/WallpapersTab.qml
+index e35d928f..6110391c 100644
+--- a/modules/widgets/dashboard/wallpapers/WallpapersTab.qml
++++ b/modules/widgets/dashboard/wallpapers/WallpapersTab.qml
+@@ -241,8 +241,22 @@ FocusScope {
+         return wallpapers;
+     }
+ 
++    // Lienzo del tab: era el unico de los cinco sin superficie propia, asi que las
++    // miniaturas y las pastillas flotaban sobre el gris del panel mientras el resto
++    // del dashboard es negro. Mismo pane que MonitorsTab/ProjectionTab.
++    StyledRect {
++        anchors.fill: parent
++        // internalbg (= background, negro puro) y NO "pane": las pastillas de esta
++        // fila tambien son "pane", asi que con ese variant el fondo quedaba del mismo
++        // gris que los controles y los controles desaparecian. Negro abajo, #131313
++        // arriba — la misma escalera que usan las demas tabs.
++        variant: "internalbg"
++        radius: Styling.radius(4)
++    }
++
+     ColumnLayout {
+         anchors.fill: parent
++        anchors.margins: 10
+         spacing: 8
+ 
+         // Barra superior con OLED mode, búsqueda y scheme selector
+@@ -255,7 +269,11 @@ FocusScope {
+             // Barra de búsqueda centrada
+             SearchInput {
+                 id: wallpaperSearchInput
+-                Layout.fillWidth: true
++                // Ancho fijo a proposito: con fillWidth el buscador se quedaba con
++                // TODO el sobrante (su implicitWidth ronda los 460) y a los filtros
++                // les tocaba 0. El unico que estira ahora es la FilterBar.
++                Layout.fillWidth: false
++                Layout.preferredWidth: 200
+                 Layout.alignment: Qt.AlignVCenter
+                 text: searchText
+                 placeholderText: "Search wallpapers..."
+@@ -350,7 +368,7 @@ FocusScope {
+                 property bool keyboardNavigationActive: false
+ 
+                 StyledRect {
+-                    variant: perScreenCheckboxContainer.keyboardNavigationActive && perScreenCheckbox.activeFocus ? "focus" : "pane"
++                    variant: perScreenCheckbox.checked ? "primary" : (((perScreenCheckboxContainer.keyboardNavigationActive && perScreenCheckbox.activeFocus) || pillPerScreen.containsMouse) ? "focus" : "pane")
+                     anchors.fill: parent
+                     radius: Styling.radius(4)
+                     opacity: 1.0
+@@ -371,13 +389,15 @@ FocusScope {
+                         Rectangle {
+                             Layout.fillWidth: true
+                             Layout.fillHeight: true
+-                            color: Colors.background
++                            // transparente: el fondo lo pone el pane de afuera. Antes
++                            // este rectangulo negro partia la pastilla en dos piezas.
++                            color: "transparent"
+                             radius: Styling.radius(0)
+ 
+                             Text {
+                                 anchors.fill: parent
+                                 text: currentScreenName // Get the monitor name!
+-                                color: Colors.overSurface
++                                color: perScreenCheckbox.checked ? Styling.srItem("primary") : Colors.overSurface
+                                 font.family: Config.theme.font
+                                 font.pixelSize: Config.theme.fontSize
+                                 font.weight: Font.Medium
+@@ -393,12 +413,28 @@ FocusScope {
+                                     }
+                                 }
+                             }
++
++                            // Toda la pastilla es el control. Antes solo el circulito
++                            // de la derecha respondia al click; la etiqueta era decorado.
++                            MouseArea {
++                                id: pillPerScreen
++                                anchors.fill: parent
++                                hoverEnabled: true
++                                cursorShape: true ? Qt.PointingHandCursor : Qt.ForbiddenCursor
++                                onClicked: {
++                                        togglePerScreenMode();
++                                }
++                            }
+                         }
+ 
+                         Item {
+                             id: perScreenCheckbox
+-                            Layout.preferredWidth: 40
+-                            Layout.preferredHeight: 40
++                            // Sin casilla: el estado lo dice el relleno de la pastilla
++                            // entera, igual que ControlButton y los chips del resto del
++                            // dashboard. Este Item se queda en 0x0 solo para conservar
++                            // el foco y los atajos de teclado.
++                            Layout.preferredWidth: 0
++                            Layout.preferredHeight: 0
+                             
+                             property bool checked: isPerScreen
+ 
+@@ -427,50 +463,6 @@ FocusScope {
+                                 }
+                             }
+ 
+-                            Item {
+-                                anchors.fill: parent
+-
+-                                Rectangle {
+-                                    anchors.fill: parent
+-                                    radius: Styling.radius(0)
+-                                    color: Colors.background
+-                                    visible: !perScreenCheckbox.checked
+-                                }
+-
+-                                StyledRect {
+-                                    variant: "primary"
+-                                    anchors.fill: parent
+-                                    radius: Styling.radius(0)
+-                                    visible: perScreenCheckbox.checked
+-                                    opacity: perScreenCheckbox.checked ? 1.0 : 0.0
+-
+-                                    Behavior on opacity {
+-                                        enabled: Config.animDuration > 0
+-                                        NumberAnimation {
+-                                            duration: Config.animDuration / 2
+-                                            easing.type: Easing.OutQuart
+-                                        }
+-                                    }
+-
+-                                    Text {
+-                                        anchors.centerIn: parent
+-                                        text: Icons.accept
+-                                        color: Styling.srItem("primary")
+-                                        font.family: Icons.font
+-                                        font.pixelSize: 20
+-                                        scale: perScreenCheckbox.checked ? 1.0 : 0.0
+-
+-                                        Behavior on scale {
+-                                            enabled: Config.animDuration > 0
+-                                            NumberAnimation {
+-                                                duration: Config.animDuration / 2
+-                                                easing.type: Easing.OutBack
+-                                                easing.overshoot: 1.5
+-                                            }
+-                                        }
+-                                    }
+-                                }
+-                            }
+ 
+                             MouseArea {
+                                 anchors.fill: parent
+@@ -487,13 +479,13 @@ FocusScope {
+             // OLED Mode
+             Item {
+                 id: oledCheckboxContainer
+-                Layout.preferredWidth: 100
++                Layout.preferredWidth: 74
+                 Layout.preferredHeight: 48
+ 
+                 property bool keyboardNavigationActive: false
+ 
+                 StyledRect {
+-                    variant: oledCheckboxContainer.keyboardNavigationActive && oledCheckbox.activeFocus ? "focus" : "pane"
++                    variant: oledCheckbox.checked ? "primary" : (((oledCheckboxContainer.keyboardNavigationActive && oledCheckbox.activeFocus) || pillOled.containsMouse) ? "focus" : "pane")
+                     anchors.fill: parent
+                     radius: Styling.radius(4)
+                     opacity: oledCheckbox.enabled ? 1.0 : 0.5
+@@ -514,13 +506,15 @@ FocusScope {
+                         Rectangle {
+                             Layout.fillWidth: true
+                             Layout.fillHeight: true
+-                            color: Colors.background
++                            // transparente: el fondo lo pone el pane de afuera. Antes
++                            // este rectangulo negro partia la pastilla en dos piezas.
++                            color: "transparent"
+                             radius: Styling.radius(0)
+ 
+                             Text {
+                                 anchors.fill: parent
+                                 text: "OLED"
+-                                color: Colors.overSurface
++                                color: oledCheckbox.checked ? Styling.srItem("primary") : Colors.overSurface
+                                 font.family: Config.theme.font
+                                 font.pixelSize: Config.theme.fontSize
+                                 font.weight: Font.Medium
+@@ -535,12 +529,29 @@ FocusScope {
+                                     }
+                                 }
+                             }
++
++                            // Toda la pastilla es el control. Antes solo el circulito
++                            // de la derecha respondia al click; la etiqueta era decorado.
++                            MouseArea {
++                                id: pillOled
++                                anchors.fill: parent
++                                hoverEnabled: true
++                                cursorShape: oledCheckbox.enabled ? Qt.PointingHandCursor : Qt.ForbiddenCursor
++                                onClicked: {
++                                        if (oledCheckbox.enabled)
++                                        Config.theme.oledMode = !Config.theme.oledMode;
++                                }
++                            }
+                         }
+ 
+                         Item {
+                             id: oledCheckbox
+-                            Layout.preferredWidth: 40
+-                            Layout.preferredHeight: 40
++                            // Sin casilla: el estado lo dice el relleno de la pastilla
++                            // entera, igual que ControlButton y los chips del resto del
++                            // dashboard. Este Item se queda en 0x0 solo para conservar
++                            // el foco y los atajos de teclado.
++                            Layout.preferredWidth: 0
++                            Layout.preferredHeight: 0
+ 
+                             property bool checked: Config.theme.oledMode
+                             property bool enabled: !Config.theme.lightMode
+@@ -580,50 +591,6 @@ FocusScope {
+                                 }
+                             }
+ 
+-                            Item {
+-                                anchors.fill: parent
+-
+-                                Rectangle {
+-                                    anchors.fill: parent
+-                                    radius: Styling.radius(0)
+-                                    color: Colors.background
+-                                    visible: !oledCheckbox.checked
+-                                }
+-
+-                                StyledRect {
+-                                    variant: "primary"
+-                                    anchors.fill: parent
+-                                    radius: Styling.radius(0)
+-                                    visible: oledCheckbox.checked
+-                                    opacity: oledCheckbox.checked ? 1.0 : 0.0
+-
+-                                    Behavior on opacity {
+-                                        enabled: Config.animDuration > 0
+-                                        NumberAnimation {
+-                                            duration: Config.animDuration / 2
+-                                            easing.type: Easing.OutQuart
+-                                        }
+-                                    }
+-
+-                                    Text {
+-                                        anchors.centerIn: parent
+-                                        text: Icons.accept
+-                                        color: Styling.srItem("primary")
+-                                        font.family: Icons.font
+-                                        font.pixelSize: 20
+-                                        scale: oledCheckbox.checked ? 1.0 : 0.0
+-
+-                                        Behavior on scale {
+-                                            enabled: Config.animDuration > 0
+-                                            NumberAnimation {
+-                                                duration: Config.animDuration / 2
+-                                                easing.type: Easing.OutBack
+-                                                easing.overshoot: 1.5
+-                                            }
+-                                        }
+-                                    }
+-                                }
+-                            }
+ 
+                             MouseArea {
+                                 anchors.fill: parent
+@@ -642,13 +609,13 @@ FocusScope {
+             // Tint Toggle a la derecha del search
+             Item {
+                 id: tintCheckboxContainer
+-                Layout.preferredWidth: 100
++                Layout.preferredWidth: 74
+                 Layout.preferredHeight: 48
+ 
+                 property bool keyboardNavigationActive: false
+ 
+                 StyledRect {
+-                    variant: tintCheckboxContainer.keyboardNavigationActive && tintCheckbox.activeFocus ? "focus" : "pane"
++                    variant: tintCheckbox.checked ? "primary" : (((tintCheckboxContainer.keyboardNavigationActive && tintCheckbox.activeFocus) || pillTint.containsMouse) ? "focus" : "pane")
+                     anchors.fill: parent
+                     radius: Styling.radius(4)
+                     opacity: 1.0
+@@ -661,25 +628,44 @@ FocusScope {
+                         Rectangle {
+                             Layout.fillWidth: true
+                             Layout.fillHeight: true
+-                            color: Colors.background
++                            // transparente: el fondo lo pone el pane de afuera. Antes
++                            // este rectangulo negro partia la pastilla en dos piezas.
++                            color: "transparent"
+                             radius: Styling.radius(0)
+ 
+                             Text {
+                                 anchors.fill: parent
+                                 text: "Tint"
+-                                color: Colors.overSurface
++                                color: tintCheckbox.checked ? Styling.srItem("primary") : Colors.overSurface
+                                 font.family: Config.theme.font
+                                 font.pixelSize: Config.theme.fontSize
+                                 font.weight: Font.Medium
+                                 verticalAlignment: Text.AlignVCenter
+                                 leftPadding: 8
+                             }
++
++                            // Toda la pastilla es el control. Antes solo el circulito
++                            // de la derecha respondia al click; la etiqueta era decorado.
++                            MouseArea {
++                                id: pillTint
++                                anchors.fill: parent
++                                hoverEnabled: true
++                                cursorShape: true ? Qt.PointingHandCursor : Qt.ForbiddenCursor
++                                onClicked: {
++                                        if (GlobalStates.wallpaperManager)
++                                        GlobalStates.wallpaperManager.tintEnabled = !GlobalStates.wallpaperManager.tintEnabled;
++                                }
++                            }
+                         }
+ 
+                         Item {
+                             id: tintCheckbox
+-                            Layout.preferredWidth: 40
+-                            Layout.preferredHeight: 40
++                            // Sin casilla: el estado lo dice el relleno de la pastilla
++                            // entera, igual que ControlButton y los chips del resto del
++                            // dashboard. Este Item se queda en 0x0 solo para conservar
++                            // el foco y los atajos de teclado.
++                            Layout.preferredWidth: 0
++                            Layout.preferredHeight: 0
+ 
+                             property bool checked: GlobalStates.wallpaperManager ? GlobalStates.wallpaperManager.tintEnabled : false
+ 
+@@ -710,50 +696,6 @@ FocusScope {
+                                 }
+                             }
+ 
+-                            Item {
+-                                anchors.fill: parent
+-
+-                                Rectangle {
+-                                    anchors.fill: parent
+-                                    radius: Styling.radius(0)
+-                                    color: Colors.background
+-                                    visible: !tintCheckbox.checked
+-                                }
+-
+-                                StyledRect {
+-                                    variant: "primary"
+-                                    anchors.fill: parent
+-                                    radius: Styling.radius(0)
+-                                    visible: tintCheckbox.checked
+-                                    opacity: tintCheckbox.checked ? 1.0 : 0.0
+-
+-                                    Behavior on opacity {
+-                                        enabled: Config.animDuration > 0
+-                                        NumberAnimation {
+-                                            duration: Config.animDuration / 2
+-                                            easing.type: Easing.OutQuart
+-                                        }
+-                                    }
+-
+-                                    Text {
+-                                        anchors.centerIn: parent
+-                                        text: Icons.accept
+-                                        color: Styling.srItem("primary")
+-                                        font.family: Icons.font
+-                                        font.pixelSize: 20
+-                                        scale: tintCheckbox.checked ? 1.0 : 0.0
+-
+-                                        Behavior on scale {
+-                                            enabled: Config.animDuration > 0
+-                                            NumberAnimation {
+-                                                duration: Config.animDuration / 2
+-                                                easing.type: Easing.OutBack
+-                                                easing.overshoot: 1.5
+-                                            }
+-                                        }
+-                                    }
+-                                }
+-                            }
+ 
+                             MouseArea {
+                                 anchors.fill: parent
+@@ -774,7 +716,9 @@ FocusScope {
+ 
+             // Scheme Selector a la derecha
+             Item {
+-                Layout.preferredWidth: 200
++                // 200 -> 160: es el control menos usado de la fila y era el que no
++                // dejaba entrar los filtros.
++                Layout.preferredWidth: 160
+                 Layout.preferredHeight: 48
+ 
+                 SchemeSelector {
+@@ -801,17 +745,25 @@ FocusScope {
+                     }
+                 }
+             }
+-        }
+ 
+-        // FilterBar centrada
+-        Item {
+-            Layout.fillWidth: true
+-            Layout.preferredHeight: wallpapersFilterBar.height
++            // FilterBar: vive en la fila de arriba. Centrada en su propia banda se
++            // comia un renglon entero de la grilla. Techo fijo porque su implicitWidth
++            // crece con los filtros de subcarpeta (tiene scroll horizontal propio).
++            Item {
++                // preferred 0 + fillWidth: el ancho implicito de esta fila lo hereda
++                // el panel entero (el dashboard se ensanchaba y se salia de la
++                // pantalla). Asi no aporta nada al implicito y usa lo que sobre.
++                Layout.fillWidth: true
++                Layout.minimumWidth: 0
++                Layout.preferredWidth: 0
++                Layout.maximumWidth: 210
++                Layout.preferredHeight: 48
++                Layout.alignment: Qt.AlignVCenter
+ 
+-            FilterBar {
+-                id: wallpapersFilterBar
+-                anchors.horizontalCenter: parent.horizontalCenter
+-                width: Math.min(implicitWidth, parent.width)
++                FilterBar {
++                    id: wallpapersFilterBar
++                    anchors.verticalCenter: parent.verticalCenter
++                    width: Math.min(implicitWidth, parent.width)
+                 activeFilters: wallpapersTabRoot.activeFilters
+ 
+                 onActiveFiltersChanged: {
+@@ -831,13 +783,15 @@ FocusScope {
+                 }
+             }
+         }
++        }
+ 
+         // Grid de wallpapers
+         ClippingRectangle {
+             id: wallpaperGridContainer
+             Layout.fillWidth: true
+             Layout.fillHeight: true
+-            color: "transparent"
++            // negro: los huecos entre miniaturas mostraban el gris del panel
++            color: Colors.background
+             radius: Styling.radius(4)
+             clip: true
+ 
+diff --git a/modules/widgets/dashboard/widgets/FullPlayer.qml b/modules/widgets/dashboard/widgets/FullPlayer.qml
+index 5c701ba5..8fe898e6 100644
+--- a/modules/widgets/dashboard/widgets/FullPlayer.qml
++++ b/modules/widgets/dashboard/widgets/FullPlayer.qml
+@@ -35,6 +35,11 @@ StyledRect {
+         return frame ? "file://" + frame : "";
+     }
+     property bool hasActivePlayer: MprisController.activePlayer !== null
++
++    // Sin reproductor activo no hay portada: caer al wallpaper pintaba una lamina
++    // gris en medio de un dashboard negro y ademas mentia — esa imagen no es la
++    // portada de nada. Sin player la tarjeta se queda en negro con su placeholder.
++    readonly property string artSource: hasActivePlayer ? ((MprisController.activePlayer?.trackArtUrl ?? "") !== "" ? MprisController.activePlayer.trackArtUrl : wallpaperPath) : ""
+     property bool isSeeking: false
+ 
+     Timer {
+@@ -105,13 +110,24 @@ StyledRect {
+         }
+     }
+ 
++    // Superficie de respaldo: el fondo de esta tarjeta lo pintaba el arte. Al dejar
++    // de caer al wallpaper cuando no hay reproductor, la tarjeta se quedaba sin
++    // fondo y mostraba el gris del panel del dashboard. Mismo negro que el resto.
++    StyledRect {
++        anchors.fill: parent
++        variant: "internalbg"
++        radius: player.playerRadius
++        visible: player.artSource === ""
++        z: -1
++    }
++
+     // Background with blur effect
+ 
+     Image {
+         mipmap: true
+         id: backgroundArtBlurred
+         anchors.fill: parent
+-        source: (MprisController.activePlayer?.trackArtUrl ?? "") !== "" ? MprisController.activePlayer.trackArtUrl : player.wallpaperPath
++        source: player.artSource
+         sourceSize: Qt.size(64, 64)
+         fillMode: Image.PreserveAspectCrop
+         visible: false
+@@ -125,8 +141,8 @@ StyledRect {
+         blurEnabled: true
+         blurMax: 32
+         blur: 1.0
+-        opacity: (player.hasArtwork || player.wallpaperPath !== "") ? 0.25 : 0.0
+-        visible: player.hasArtwork || player.wallpaperPath !== ""
++        opacity: player.artSource !== "" ? 0.25 : 0.0
++        visible: player.artSource !== ""
+         Behavior on opacity {
+             enabled: Config.animDuration > 0
+             NumberAnimation {
+@@ -140,7 +156,7 @@ StyledRect {
+         mipmap: true
+         id: backgroundArtFull
+         anchors.fill: parent
+-        source: (MprisController.activePlayer?.trackArtUrl ?? "") !== "" ? MprisController.activePlayer.trackArtUrl : player.wallpaperPath
++        source: player.artSource
+         fillMode: Image.PreserveAspectCrop
+         visible: false
+         asynchronous: true
+@@ -155,8 +171,8 @@ StyledRect {
+         maskInverted: true
+         maskThresholdMin: 0.5
+         maskSpreadAtMin: 1.0
+-        opacity: (player.hasArtwork || player.wallpaperPath !== "") ? 1.0 : 0.0
+-        visible: player.hasArtwork || player.wallpaperPath !== ""
++        opacity: player.artSource !== "" ? 1.0 : 0.0
++        visible: player.artSource !== ""
+         Behavior on opacity {
+             enabled: Config.animDuration > 0
+             NumberAnimation {
+@@ -244,7 +260,7 @@ StyledRect {
+                         mipmap: true
+                         id: coverArt
+                         anchors.fill: parent
+-                        source: (MprisController.activePlayer?.trackArtUrl ?? "") !== "" ? MprisController.activePlayer.trackArtUrl : player.wallpaperPath
++                        source: player.artSource
+                         sourceSize: Qt.size(256, 256)
+                         fillMode: Image.PreserveAspectCrop
+                         asynchronous: true
+@@ -253,7 +269,7 @@ StyledRect {
+                         Rectangle {
+                             anchors.fill: parent
+                             color: Colors.surface
+-                            visible: !player.hasArtwork && player.wallpaperPath === ""
++                            visible: player.artSource === ""
+ 
+                             Loader {
+                                 active: parent.visible && Config.performance.wavyLine
+diff --git a/modules/widgets/dashboard/widgets/NotificationHistory.qml b/modules/widgets/dashboard/widgets/NotificationHistory.qml
+index 38797936..73933b35 100644
+--- a/modules/widgets/dashboard/widgets/NotificationHistory.qml
++++ b/modules/widgets/dashboard/widgets/NotificationHistory.qml
+@@ -2,6 +2,7 @@ import QtQuick
+ import QtQuick.Layouts
+ import QtQuick.Effects
+ import Quickshell.Widgets
++import Quickshell.Io
+ import qs.modules.theme
+ import qs.modules.components
+ import qs.modules.services
+@@ -13,6 +14,31 @@ Item {
+     id: root
+     property var cascadeItems: []
+     property int cascadeIndex: -1
++    property bool showClipboard: false
++
++    // Process for copying a clipboard item's full content (mirrors ClipboardTab.copyToClipboard)
++    function copyClipboardItem(item) {
++        if (!item)
++            return;
++        if (item.isImage && item.binaryPath) {
++            copyProcess.command = ["sh", "-c", "cat '" + item.binaryPath + "' | wl-copy --type '" + item.mime + "'"];
++        } else if (item.isFile) {
++            copyProcess.command = ["sh", "-c", "sqlite3 '" + ClipboardService.dbPath + "' \"SELECT full_content FROM clipboard_items WHERE id = " + item.id + ";\" | tr -d '\\r' | wl-copy --type text/uri-list"];
++        } else {
++            copyProcess.command = ["sh", "-c", "sqlite3 '" + ClipboardService.dbPath + "' \"SELECT full_content FROM clipboard_items WHERE id = " + item.id + ";\" | wl-copy"];
++        }
++        copyProcess.running = true;
++    }
++
++    Process {
++        id: copyProcess
++        running: false
++    }
++
++    onShowClipboardChanged: {
++        if (showClipboard)
++            ClipboardService.list();
++    }
+ 
+     Shortcut {
+         sequence: "Ctrl+L"
+@@ -104,17 +130,47 @@ Item {
+ 
+                         Text {
+                             anchors.centerIn: parent
+-                            text: "Notifications"
++                            text: root.showClipboard ? "Portapapeles" : "Notificaciones"
+                             font.family: Config.defaultFont
+-                            font.pixelSize: Config.theme.fontSize
+-                            font.weight: Font.Bold
++                            font.pixelSize: Styling.fontSize(-3)
++                            font.weight: Font.DemiBold
++                            font.letterSpacing: 1.4
++                            font.capitalization: Font.AllUppercase
+                             color: titleRect.item
+                             horizontalAlignment: Text.AlignHCenter
+                         }
+                     }
+ 
++                    StyledRect {
++                        id: clipboardToggle
++                        variant: root.showClipboard ? "primary" : (clipboardHover.containsMouse ? "focus" : "internalbg")
++                        Layout.preferredWidth: 32
++                        Layout.fillHeight: true
++                        radius: root.showClipboard ? Styling.radius(-4) : Styling.radius(0)
++
++                        readonly property color clipboardItem: root.showClipboard ? itemColor : Styling.srItem("overprimary")
++
++                        Text {
++                            anchors.centerIn: parent
++                            text: Icons.clipboard
++                            textFormat: Text.RichText
++                            font.family: Icons.font
++                            font.pixelSize: 18
++                            color: clipboardToggle.clipboardItem
++                        }
++
++                        MouseArea {
++                            id: clipboardHover
++                            anchors.fill: parent
++                            cursorShape: Qt.PointingHandCursor
++                            hoverEnabled: true
++                            onClicked: root.showClipboard = !root.showClipboard
++                        }
++                    }
++
+                     StyledRect {
+                         id: dndToggle
++                        visible: !root.showClipboard
+                         variant: Notifications.silent ? "primary" : (dndHover.containsMouse ? "focus" : "internalbg")
+                         Layout.preferredWidth: 32
+                         Layout.fillHeight: true
+@@ -163,7 +219,7 @@ Item {
+                             anchors.fill: parent
+                             cursorShape: Qt.PointingHandCursor
+                             hoverEnabled: true
+-                            onClicked: discardAllWithAnimation()
++                            onClicked: root.showClipboard ? ClipboardService.clear() : discardAllWithAnimation()
+                         }
+                     }
+                 }
+@@ -173,6 +229,7 @@ Item {
+                     Layout.fillHeight: true
+                     color: "transparent"
+                     radius: Styling.radius(0)
++                    visible: !root.showClipboard
+ 
+                     Flickable {
+                         anchors.fill: parent
+@@ -200,17 +257,102 @@ Item {
+                             }
+                         }
+                     }
++                
++                    // Una pantalla vacia tiene que decir que esta vacia. Antes este
++                    // panel era un vacio negro del alto del dashboard y no se sabia
++                    // si estaba cargando, roto o simplemente sin nada.
++                    ColumnLayout {
++                        anchors.centerIn: parent
++                        spacing: 6
++                        visible: Notifications.appNameList.length === 0
++
++                        Text {
++                            Layout.alignment: Qt.AlignHCenter
++                            text: Notifications.silent ? Icons.bellZ : Icons.bellSlash
++                            font.family: Icons.font
++                            font.pixelSize: 26
++                            color: Colors.overSurfaceVariant
++                            opacity: 0.35
++                        }
++
++                        Text {
++                            Layout.alignment: Qt.AlignHCenter
++                            text: Notifications.silent ? "No molestar activado" : "Sin notificaciones"
++                            font.family: Config.theme.font
++                            font.pixelSize: Styling.fontSize(-3)
++                            font.weight: Font.DemiBold
++                            font.letterSpacing: 1.3
++                            font.capitalization: Font.AllUppercase
++                            color: Colors.overSurfaceVariant
++                            opacity: 0.5
++                        }
++                    }
++                }
++
++                ClippingRectangle {
++                    Layout.fillWidth: true
++                    Layout.fillHeight: true
++                    color: "transparent"
++                    radius: Styling.radius(0)
++                    visible: root.showClipboard
++
++                    Flickable {
++                        anchors.fill: parent
++                        contentWidth: width
++                        contentHeight: clipboardList.contentHeight
++                        clip: true
++
++                        ListView {
++                            id: clipboardList
++                            width: parent.width
++                            height: contentHeight
++                            spacing: 4
++                            model: ClipboardService.items
++                            interactive: false
++                            cacheBuffer: 200
++                            reuseItems: true
++
++                            delegate: StyledRect {
++                                id: clipDelegate
++                                required property var modelData
++                                variant: clipHover.containsMouse ? "focus" : "internalbg"
++                                width: clipboardList.width
++                                height: 36
++                                radius: Styling.radius(2)
++
++                                Text {
++                                    anchors.fill: parent
++                                    anchors.leftMargin: 8
++                                    anchors.rightMargin: 8
++                                    verticalAlignment: Text.AlignVCenter
++                                    elide: Text.ElideRight
++                                    text: clipDelegate.modelData.isImage ? "[Image]" : (clipDelegate.modelData.alias || clipDelegate.modelData.preview || "").replace(/\n/g, " ")
++                                    font.family: Config.defaultFont
++                                    font.pixelSize: Config.theme.fontSize
++                                    color: Styling.srItem("internalbg")
++                                }
++
++                                MouseArea {
++                                    id: clipHover
++                                    anchors.fill: parent
++                                    cursorShape: Qt.PointingHandCursor
++                                    hoverEnabled: true
++                                    onClicked: root.copyClipboardItem(clipDelegate.modelData)
++                                }
++                            }
++                        }
++                    }
+                 }
+             }
+ 
+             Column {
+                 anchors.centerIn: parent
+                 spacing: 16
+-                visible: Notifications.appNameList.length === 0
++                visible: root.showClipboard ? ClipboardService.items.length === 0 : Notifications.appNameList.length === 0
+ 
+                 Image {
+                     mipmap: true
+-                    source: Qt.resolvedUrl("../../../../assets/ambxst/ambxst-logo.svg")
++                    source: Qt.resolvedUrl("/home/emerson/.config/ambxst/assets/mahoraga.png")
+                     opacity: 0.25
+                     sourceSize.width: 64
+                     sourceSize.height: 64
+diff --git a/modules/widgets/dashboard/widgets/calendar/Calendar.qml b/modules/widgets/dashboard/widgets/calendar/Calendar.qml
+index face38d4..ab7c720e 100644
+--- a/modules/widgets/dashboard/widgets/calendar/Calendar.qml
++++ b/modules/widgets/dashboard/widgets/calendar/Calendar.qml
+@@ -70,8 +70,10 @@ Item {
+                             anchors.centerIn: parent
+                             text: viewingDate.toLocaleDateString(Qt.locale(), "MMMM yyyy")
+                             font.family: Config.defaultFont
+-                            font.pixelSize: Config.theme.fontSize
+-                            font.weight: Font.Bold
++                            font.pixelSize: Styling.fontSize(-3)
++                            font.weight: Font.DemiBold
++                            font.letterSpacing: 1.4
++                            font.capitalization: Font.AllUppercase
+                             color: titleRect.item
+                             horizontalAlignment: Text.AlignHCenter
+                         }
+diff --git a/modules/widgets/dashboard/widgets/calendar/CalendarDayButton.qml b/modules/widgets/dashboard/widgets/calendar/CalendarDayButton.qml
+index 4a99c804..c12f69f6 100644
+--- a/modules/widgets/dashboard/widgets/calendar/CalendarDayButton.qml
++++ b/modules/widgets/dashboard/widgets/calendar/CalendarDayButton.qml
+@@ -32,9 +32,14 @@ Rectangle {
+             text: day
+             horizontalAlignment: Text.AlignHCenter
+             verticalAlignment: Text.AlignVCenter
+-            font.weight: Font.Bold
+-            font.pixelSize: Styling.fontSize(-2)
+-            font.family: Config.defaultFont
++            // Mono: en una reja de numeros las cifras tienen que tener todas el
++            // mismo ancho o las columnas se ven torcidas. Medium en vez de Bold —
++            // el dia de hoy ya se distingue por el relleno, no hace falta gritar.
++            font.weight: (isToday === 1 || bold) ? Font.DemiBold : Font.Medium
++            font.pixelSize: Styling.monoFontSize(-3)
++            font.family: bold ? Config.theme.font : Config.theme.monoFont
++            font.letterSpacing: bold ? 1.2 : 0
++            font.capitalization: bold ? Font.AllUppercase : Font.MixedCase
+             color: {
+                 if (isToday === 1)
+                     return Styling.srItem("primary");

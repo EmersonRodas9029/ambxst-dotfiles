@@ -1,0 +1,84 @@
+--- system_monitor.py.orig	2026-10-14 17:36:12.159275915 -0600
++++ /home/emerson/.local/src/ambxst/scripts/system_monitor.py	2026-10-14 17:36:12.203741141 -0600
+@@ -89,6 +89,11 @@
+                                 "vendor": "intel",
+                                 "name": f"Intel GPU {card[-1]}",
+                                 "card": card,
++                                "pdev": os.path.basename(
++                                    os.path.realpath(f"{drm_base}/{card}/device")
++                                ),
++                                "prev_ns": None,
++                                "prev_t": 0.0,
+                             }
+                         )
+                 except:
+@@ -202,6 +207,58 @@
+                 usage_map[mount] = 0.0
+         return usage_map
+ 
++    def _intel_busy(self, gpu):
++        """% de uso de una iGPU Intel leyendo /proc/*/fdinfo (igual que nvtop).
++
++        ponytail: recorre /proc en cada muestra. Barato porque el monitor solo corre
++        con el dashboard abierto en la pestaña de recursos; si molestara, el salto es
++        a intel_gpu_top, que necesita permisos de perf.
++        """
++        pdev = gpu.get("pdev")
++        total = 0
++        seen = set()
++        for pid in os.listdir("/proc"):
++            if not pid.isdigit():
++                continue
++            fddir = f"/proc/{pid}/fdinfo"
++            try:
++                fds = os.listdir(fddir)
++            except OSError:
++                continue
++            for fd in fds:
++                try:
++                    with open(os.path.join(fddir, fd), "r") as f:
++                        data = f.read()
++                except OSError:
++                    continue
++                if "drm-client-id" not in data:
++                    continue
++                cid = None
++                same_card = pdev is None
++                busy = 0
++                for line in data.splitlines():
++                    if line.startswith("drm-client-id:"):
++                        cid = line.split(":", 1)[1].strip()
++                    elif line.startswith("drm-pdev:"):
++                        same_card = line.split(":", 1)[1].strip() == pdev
++                    elif line.startswith("drm-engine-"):
++                        # render, copy, video y video-enhance van al mismo total
++                        try:
++                            busy += int(line.split(":", 1)[1].strip().split()[0])
++                        except ValueError:
++                            pass
++                if cid is not None and same_card and cid not in seen:
++                    seen.add(cid)
++                    total += busy
++
++        now = time.monotonic()
++        prev_ns, prev_t = gpu.get("prev_ns"), gpu.get("prev_t")
++        gpu["prev_ns"], gpu["prev_t"] = total, now
++        if prev_ns is None or now <= prev_t:
++            return 0.0
++        pct = (total - prev_ns) / ((now - prev_t) * 1e9) * 100.0
++        return max(0.0, min(100.0, pct))
++
+     def get_gpu_stats(self):
+         usages = []
+         temps = []
+@@ -258,7 +315,9 @@
+                 except:
+                     pass
+             elif gpu["vendor"] == "intel":
+-                pass
++                # i915 no expone un busy_percent como amdgpu: hay que sumar los
++                # nanosegundos por cliente DRM y derivar el porcentaje entre muestras.
++                u = self._intel_busy(gpu)
+             usages.append(u)
+             temps.append(t)
+         return usages, temps

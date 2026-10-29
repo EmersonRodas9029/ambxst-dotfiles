@@ -1,0 +1,15 @@
+[Unit]
+Description=Ambxst Shell Service
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ambxst
+Restart=on-failure
+RestartSec=5
+Environment="DISPLAY=:0"
+Environment="WAYLAND_DISPLAY=wayland-0"
+
+[Install]
+WantedBy=default.target

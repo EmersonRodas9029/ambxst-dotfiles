@@ -1,0 +1,27 @@
+{
+  "position": "top",
+  "launcherIcon": "/home/emerson/.config/ambxst/assets/mahoraga.png",
+  "launcherIconTint": false,
+  "launcherIconFullTint": false,
+  "launcherIconSize": 18,
+  "pillStyle": "default",
+  "screenList": ["eDP-1"],
+  "enableFirefoxPlayer": false,
+  "barColor": [
+    [
+      "surface",
+      0
+    ]
+  ],
+  "frameEnabled": false,
+  "frameThickness": 8,
+  "pinnedOnStartup": false,
+  "hoverToReveal": false,
+  "hoverRegionHeight": 8,
+  "showPinButton": false,
+  "availableOnFullscreen": true,
+  "use12hFormat": false,
+  "containBar": false,
+  "keepBarShadow": false,
+  "keepBarBorder": false
+}

@@ -1,0 +1,109 @@
+#!/bin/sh
+# Genera la paleta desde el color MAYORITARIO del wallpaper.
+#
+# `matugen image` usa el scoring de Material You: descarta los tonos sin croma
+# y premia el saturado aunque sea el 1% de los pixeles. Con un fondo 99%
+# blanco y negro, el ojo rojo ganaba. Aqui el color sale del histograma, por
+# cantidad de pixeles. Y si ese color mayoritario es casi gris, el esquema
+# pasa a scheme-monochrome: matugen le inventaria un tinte (cian) a un gris.
+#
+# Uso: matugen-wallpaper.sh <imagen> [args de matugen...]
+# ponytail: 8 colores cuantizados sobre 200x200, gris si max-min <= 20.
+# Sube QUANT si un degradado fino sale aplanado, GRAY si un fondo apenas
+# teñido deberia salir gris.
+set -e
+
+QUANT=${QUANT:-8}
+GRAY=${GRAY:-12}
+SEEK=${SEEK:-2}
+
+dominant() {
+    magick "$1" -alpha off -resize 200x200! -colors "$QUANT" -depth 8 \
+        -format %c histogram:info: \
+        | sort -rn | head -1 | grep -o '#[0-9A-Fa-f]\{6\}'
+}
+
+# Imprime una imagen fija analizable: un frame si <1> es video, <1> si no.
+still_of() {
+    case "$1" in
+    *.mp4|*.MP4|*.mkv|*.webm|*.mov|*.avi|*.m4v)
+        ffmpeg -loglevel quiet -ss "$SEEK" -i "$1" -frames:v 1 -y "$2" \
+            </dev/null 2>/dev/null && [ -s "$2" ] && echo "$2"
+        ;;
+    *) echo "$1" ;;
+    esac
+}
+
+# 0 si el color tiene croma, 1 si es gris/blanco/negro
+is_gray() {
+    r=$((16#$(echo "$1" | cut -c2-3)))
+    g=$((16#$(echo "$1" | cut -c4-5)))
+    b=$((16#$(echo "$1" | cut -c6-7)))
+    max=$r; [ $g -gt $max ] && max=$g; [ $b -gt $max ] && max=$b
+    min=$r; [ $g -lt $min ] && min=$g; [ $b -lt $min ] && min=$b
+    [ $((max - min)) -le "$GRAY" ]
+}
+
+# Reemplaza el valor de -t por scheme-monochrome, conservando el resto
+force_mono() {
+    n=$#; prev=
+    while [ "$n" -gt 0 ]; do
+        a=$1; shift
+        [ "$prev" = "-t" ] && a=scheme-monochrome
+        prev=$a
+        set -- "$@" "$a"
+        n=$((n - 1))
+    done
+    printf '%s\n' "$@"
+}
+
+if [ "$1" = "--check" ]; then
+    tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+    # 99% blanco/negro + 1% rojo: el caso que rompia matugen image
+    magick -size 100x100 xc:white -fill black -draw 'rectangle 0,0 99,49' \
+        -fill red -draw 'rectangle 0,0 9,9' "$tmp/t.png"
+    got=$(dominant "$tmp/t.png")
+    case "$got" in '#F'*|'#f'*|'#0'*) ;; *) echo "FAIL: $got no es blanco/negro"; exit 1 ;; esac
+    is_gray "$got" || { echo "FAIL: $got deberia ser gris"; exit 1; }
+    is_gray '#8C2931' && { echo "FAIL: el rojo paso por gris"; exit 1; }
+    [ "$(force_mono -c x.toml -t scheme-tonal-spot -m light)" \
+        = "$(printf -- '-c\nx.toml\n-t\nscheme-monochrome\n-m\nlight\n')" ] \
+        || { echo "FAIL: force_mono"; exit 1; }
+    # Un video no debe llegar a magick: primero se le saca un frame
+    ffmpeg -loglevel quiet -f lavfi -i "color=c=#64453A:s=64x64:d=3" -y "$tmp/v.mp4" \
+        </dev/null 2>/dev/null
+    still=$(still_of "$tmp/v.mp4" "$tmp/still.png")
+    [ "$still" = "$tmp/still.png" ] || { echo "FAIL: no se extrajo frame del video"; exit 1; }
+    vcolor=$(dominant "$still")
+    is_gray "$vcolor" && { echo "FAIL: el frame del video salio gris: $vcolor"; exit 1; }
+    [ "$(still_of "$tmp/t.png" "$tmp/no.png")" = "$tmp/t.png" ] \
+        || { echo "FAIL: una imagen no debe pasar por ffmpeg"; exit 1; }
+
+    echo "OK: $got / video $vcolor"
+    exit 0
+fi
+
+img=$1
+shift
+
+work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
+src=$(still_of "$img" "$work/frame.png")
+# ffmpeg fallo con un video: que magick lo intente, es lo unico que queda
+[ -n "$src" ] || src=$img
+
+color=$(dominant "$src" || true)
+
+# Sin magick o imagen ilegible: comportamiento original de ambxst
+if [ -z "$color" ]; then
+    matugen image "$src" --source-color-index 0 "$@"
+    exit $?
+fi
+
+if is_gray "$color"; then
+    IFS='
+'
+    set -- $(force_mono "$@")
+    unset IFS
+fi
+
+matugen color hex "$color" "$@"

@@ -1,0 +1,1417 @@
+--- LockScreen.qml.orig	2026-10-14 12:29:52.756114802 -0600
++++ LockScreen.qml.custom	2026-10-14 17:03:29.829645117 -0600
+@@ -11,7 +11,9 @@
+ import qs.modules.corners
+ import qs.modules.theme
+ import qs.modules.globals
+-import qs.modules.widgets.dashboard.widgets
++import qs.modules.services
++import Quickshell.Services.Mpris
++import Quickshell.Widgets
+ import qs.config
+ 
+ // Lock surface UI - shown on each screen when locked
+@@ -20,6 +22,24 @@
+ 
+     property bool startAnim: false
+     property bool authenticating: false
++    property bool idle: false
++    property bool capsLockOn: false
++    // Si el compositor no reporta monitor enfocado, mostramos el login en todas las pantallas
++    // ponytail: si tecleaste en esta pantalla, el login es de esta pantalla
++    property bool typedHere: false
++    // ponytail: el panel de notificaciones arranca cerrado, se abre tocando el contador
++    property bool showNotifs: false
++    readonly property bool isActiveScreen: root.typedHere || !AxctlService.focusedMonitor || !AxctlService.focusedMonitor.name || AxctlService.focusedMonitor.name === (root.screen ? root.screen.name : "")
++
++    function runPower(cmd) {
++        powerProc.command = ["sh", "-c", cmd];
++        powerProc.running = true;
++    }
++
++    function wake() {
++        root.idle = false;
++        idleTimer.restart();
++    }
+     property string errorMessage: ""
+     property int failLockSecondsLeft: 0
+ 
+@@ -58,7 +78,7 @@
+         layer.enabled: true
+         layer.effect: MultiEffect {
+             blurEnabled: true
+-            blur: startAnim ? 1 : 0
++            blur: startAnim ? 0.5 : 0
+             blurMax: 64
+         }
+ 
+@@ -112,8 +132,22 @@
+     Rectangle {
+         id: dimOverlay
+         anchors.fill: parent
+-        color: "black"
+-        opacity: startAnim ? 0.25 : 0
++        opacity: startAnim ? 1 : 0
++
++        gradient: Gradient {
++            GradientStop {
++                position: 0.0
++                color: Qt.rgba(0, 0, 0, 0.3)
++            }
++            GradientStop {
++                position: 0.45
++                color: Qt.rgba(0, 0, 0, 0.58)
++            }
++            GradientStop {
++                position: 1.0
++                color: Qt.rgba(0, 0, 0, 0.42)
++            }
++        }
+         z: 3
+ 
+         property real zoomScale: startAnim ? 1.1 : 1.0
+@@ -142,165 +176,531 @@
+         }
+     }
+ 
+-    // Clock (center)
+-    Item {
+-        id: clockContainer
+-        anchors.centerIn: parent
+-        width: clockRow.width
+-        height: hoursText.height + (hoursText.height * 0.5)
++    // Bloque central: hora, fecha y login (stack elegante)
++    Column {
++        id: centerStack
++        anchors.horizontalCenter: parent.horizontalCenter
++        anchors.verticalCenter: parent.verticalCenter
++        anchors.verticalCenterOffset: -32
++        spacing: 0
+         z: 10
+ 
+         property date currentTime: new Date()
+ 
+-        Row {
+-            id: clockRow
+-            spacing: 0
+-            anchors.top: parent.top
++        opacity: startAnim ? 1 : 0
++        property real riseOffset: startAnim ? 0 : 32
+ 
+-            Text {
+-                id: hoursText
+-                text: Config.bar.use12hFormat ? (clockContainer.currentTime.getHours() % 12 || 12).toString() : Qt.formatTime(clockContainer.currentTime, "hh")
+-                font.family: "League Gothic"
+-                font.pixelSize: 240
+-                color: Colors.primaryFixed
+-                antialiasing: true
+-                opacity: startAnim ? 1 : 0
++        transform: Translate {
++            y: centerStack.riseOffset
++        }
+ 
+-                property real slideOffset: startAnim ? 0 : -150
++        Behavior on opacity {
++            enabled: Config.animDuration > 0
++            NumberAnimation {
++                duration: Config.animDuration * 2
++                easing.type: Easing.OutQuad
++            }
++        }
+ 
+-                transform: Translate {
+-                    y: hoursText.slideOffset
+-                }
++        Behavior on riseOffset {
++            enabled: Config.animDuration > 0
++            NumberAnimation {
++                duration: Config.animDuration * 3
++                easing.type: Easing.OutExpo
++            }
++        }
++
++        Timer {
++            interval: 1000
++            running: true
++            repeat: true
++            onTriggered: centerStack.currentTime = new Date()
++        }
++
++        // Hora
++        Row {
++            anchors.horizontalCenter: parent.horizontalCenter
++            spacing: 12
++
++            Row {
++                id: timeRow
++                spacing: 0
+ 
+                 layer.enabled: true
+-                layer.effect: BgShadow {}
++                layer.effect: MultiEffect {
++                    shadowEnabled: true
++                    shadowHorizontalOffset: 0
++                    shadowVerticalOffset: 3
++                    shadowBlur: 1.0
++                    shadowColor: "black"
++                    shadowOpacity: 0.5
++                }
++
++                Text {
++                    id: hoursText
++                    text: Config.bar.use12hFormat ? (centerStack.currentTime.getHours() % 12 || 12).toString() : Qt.formatTime(centerStack.currentTime, "HH")
++                    font.family: "Roboto"
++                    font.weight: Font.Light
++                    font.pixelSize: 150
++                    font.letterSpacing: -2
++                    color: Qt.rgba(1, 1, 1, 0.97)
++                    antialiasing: true
++
++                    onTextChanged: hourFade.restart()
+ 
+-                Behavior on opacity {
+-                    enabled: Config.animDuration > 0
+                     NumberAnimation {
+-                        duration: Config.animDuration * 2
+-                        easing.type: Easing.OutExpo
++                        id: hourFade
++                        target: hoursText
++                        property: "opacity"
++                        from: 0.3
++                        to: 1
++                        duration: Config.animDuration * 3
++                        easing.type: Easing.OutQuad
+                     }
+                 }
+ 
+-                Behavior on slideOffset {
+-                    enabled: Config.animDuration > 0
++                Text {
++                    id: colonText
++                    text: ":"
++                    font.family: "Roboto"
++                    font.weight: Font.Light
++                    font.pixelSize: 150
++                    font.letterSpacing: -2
++                    color: Qt.rgba(1, 1, 1, 0.97)
++                    opacity: 0.45
++                    antialiasing: true
++                }
++
++                Text {
++                    id: minutesText
++                    text: Qt.formatTime(centerStack.currentTime, "mm")
++                    font.family: "Roboto"
++                    font.weight: Font.Light
++                    font.pixelSize: 150
++                    font.letterSpacing: -2
++                    color: Qt.rgba(1, 1, 1, 0.97)
++                    antialiasing: true
++
++                    onTextChanged: minuteFade.restart()
++
+                     NumberAnimation {
+-                        duration: Config.animDuration * 2
+-                        easing.type: Easing.OutExpo
++                        id: minuteFade
++                        target: minutesText
++                        property: "opacity"
++                        from: 0.3
++                        to: 1
++                        duration: Config.animDuration * 3
++                        easing.type: Easing.OutQuad
+                     }
+                 }
+             }
+ 
+             Text {
+-                id: minutesText
+-                text: Qt.formatTime(clockContainer.currentTime, "mm")
+-                font.family: "League Gothic"
+-                font.pixelSize: 240
+-                color: Colors.primaryFixedDim
++                id: amPmText
++                visible: Config.bar.use12hFormat
++                text: Qt.formatTime(centerStack.currentTime, "ap").toUpperCase()
++                font.family: "Roboto"
++                font.weight: Font.Light
++                font.pixelSize: 24
++                font.letterSpacing: 3
++                color: Qt.rgba(1, 1, 1, 0.75)
++                opacity: 0.9
+                 antialiasing: true
+-                anchors.verticalCenter: undefined
+-                anchors.top: hoursText.top
+-                anchors.topMargin: hoursText.height * 0.5
+-                opacity: startAnim ? 1 : 0
+-
+-                property real slideOffset: startAnim ? 0 : 150
+-
+-                transform: Translate {
+-                    y: minutesText.slideOffset
+-                }
++                anchors.bottom: parent.bottom
++                anchors.bottomMargin: 38
+ 
+                 layer.enabled: true
+                 layer.effect: BgShadow {}
++            }
++        }
++
++        // Fecha
++        Text {
++            id: dateText
++            anchors.horizontalCenter: parent.horizontalCenter
++            anchors.horizontalCenterOffset: 3
++            text: centerStack.currentTime.toLocaleDateString(Qt.locale("es_MX"), "dddd d 'de' MMMM").toUpperCase()
++            font.family: "Roboto"
++            font.weight: Font.Medium
++            font.pixelSize: 13
++            font.letterSpacing: 7
++            color: Colors.primaryFixedDim
++            opacity: 0.9
++            antialiasing: true
++
++            layer.enabled: true
++            layer.effect: MultiEffect {
++                shadowEnabled: true
++                shadowHorizontalOffset: 0
++                shadowVerticalOffset: 2
++                shadowBlur: 0.9
++                shadowColor: "black"
++                shadowOpacity: 0.65
++            }
++        }
++
++        // Notificaciones pendientes (solo el conteo, no el contenido)
++        Item {
++            width: notifRow.width
++            height: 34
++            anchors.horizontalCenter: parent.horizontalCenter
++            visible: Notifications.list.length > 0
++
++            Row {
++                id: notifRow
++                anchors.centerIn: parent
++                spacing: 7
++                opacity: root.showNotifs || notifToggle.containsMouse ? 1 : 0.75
+ 
+                 Behavior on opacity {
+                     enabled: Config.animDuration > 0
+                     NumberAnimation {
+-                        duration: Config.animDuration * 2
+-                        easing.type: Easing.OutExpo
++                        duration: Config.animDuration
++                        easing.type: Easing.OutQuad
+                     }
+                 }
+ 
+-                Behavior on slideOffset {
+-                    enabled: Config.animDuration > 0
+-                    NumberAnimation {
+-                        duration: Config.animDuration * 2
+-                        easing.type: Easing.OutExpo
+-                    }
++                Text {
++                    anchors.verticalCenter: parent.verticalCenter
++                    text: Icons.bell
++                    font.family: Icons.font
++                    font.pixelSize: 13
++                    color: Qt.rgba(1, 1, 1, 0.6)
++                }
++
++                Text {
++                    anchors.verticalCenter: parent.verticalCenter
++                    text: Notifications.list.length === 1 ? "1 NOTIFICACIÓN" : Notifications.list.length + " NOTIFICACIONES"
++                    font.family: "Roboto"
++                    font.weight: Font.Medium
++                    font.pixelSize: 11
++                    font.letterSpacing: 3
++                    color: Qt.rgba(1, 1, 1, 0.6)
++                    antialiasing: true
++                }
++            }
++
++            MouseArea {
++                id: notifToggle
++                anchors.fill: parent
++                anchors.margins: -8
++                hoverEnabled: true
++                cursorShape: Qt.PointingHandCursor
++                onEntered: root.wake()
++                onClicked: {
++                    root.wake();
++                    root.showNotifs = !root.showNotifs;
+                 }
+             }
+ 
++            layer.enabled: true
++            layer.effect: BgShadow {}
++        }
++
++        Item {
++            width: 1
++            height: 40
++        }
++
++        // Aviso de Bloq Mayús
++        Row {
++            anchors.horizontalCenter: parent.horizontalCenter
++            spacing: 7
++            visible: root.capsLockOn && root.isActiveScreen && !root.idle
++
++            Text {
++                anchors.verticalCenter: parent.verticalCenter
++                text: Icons.lock
++                font.family: Icons.font
++                font.pixelSize: 12
++                color: Colors.error
++            }
++
+             Text {
+-                id: amPmText
+-                text: Config.bar.use12hFormat ? Qt.formatTime(clockContainer.currentTime, "ap").toLowerCase() : ""
+-                font.family: "League Gothic"
+-                font.pixelSize: 100
+-                color: hoursText.color
++                anchors.verticalCenter: parent.verticalCenter
++                text: "BLOQ MAYÚS"
++                font.family: "Roboto"
++                font.weight: Font.Medium
++                font.pixelSize: 11
++                font.letterSpacing: 3
++                color: Colors.error
+                 antialiasing: true
+-                anchors.top: hoursText.top
+-                anchors.topMargin: hoursText.height * 0.35 
+-                visible: Config.bar.use12hFormat
+-                opacity: startAnim ? 1 : 0
++            }
++
++            layer.enabled: true
++            layer.effect: BgShadow {}
++        }
+ 
+-                property real slideOffset: startAnim ? 0 : -150
++        Item {
++            width: 1
++            height: 12
++        }
+ 
+-                transform: Translate {
+-                    y: amPmText.slideOffset
++        // Login
++        Rectangle {
++            id: passwordInputBox
++            anchors.horizontalCenter: parent.horizontalCenter
++            width: 300
++            height: 48
++            visible: root.isActiveScreen
++            opacity: root.idle ? 0 : 1
++
++            Behavior on opacity {
++                enabled: Config.animDuration > 0
++                NumberAnimation {
++                    duration: Config.animDuration * 3
++                    easing.type: Easing.OutQuad
+                 }
++            }
++            radius: height / 2
++            color: Qt.rgba(0, 0, 0, authenticating ? 0.18 : 0.3)
++            border.width: 1
++            border.color: passwordInputBox.showError ? Colors.error : Qt.rgba(1, 1, 1, passwordInput.activeFocus ? 0.38 : 0.22)
+ 
+-                layer.enabled: true
+-                layer.effect: BgShadow {}
++            property real shakeOffset: 0
++            property bool showError: false
++
++            transform: Translate {
++                x: passwordInputBox.shakeOffset
++            }
++
++            Behavior on color {
++                enabled: Config.animDuration > 0
++                ColorAnimation {
++                    duration: Config.animDuration
++                    easing.type: Easing.OutCubic
++                }
++            }
++
++            Behavior on border.color {
++                enabled: Config.animDuration > 0
++                ColorAnimation {
++                    duration: Config.animDuration
++                    easing.type: Easing.OutCubic
++                }
++            }
++
++            TextField {
++                id: passwordInput
++                anchors.fill: parent
++                anchors.leftMargin: 44
++                anchors.rightMargin: 44
++                horizontalAlignment: TextInput.AlignHCenter
++                verticalAlignment: TextInput.AlignVCenter
++                cursorDelegate: Rectangle {
++                    width: 1
++                    height: 18
++                    color: Qt.rgba(1, 1, 1, 0.8)
++                    visible: passwordInput.text.length > 0
++                }
++                font.family: "Roboto"
++                font.weight: Font.Normal
++                font.pixelSize: 15
++                font.letterSpacing: passwordInput.text.length > 0 ? 4 : 2
++                color: Qt.rgba(1, 1, 1, 0.95)
++                background: null
++                echoMode: TextInput.Password
++                passwordCharacter: "•"
++                passwordMaskDelay: 0
++                enabled: !authenticating
++
++                Keys.onPressed: event => {
++                    root.wake();
++                    event.accepted = false;
++                }
++
++                onActiveFocusChanged: if (!activeFocus && root.isActiveScreen && !root.authenticating)
++                    refocus.restart()
++
++                Timer {
++                    id: refocus
++                    interval: 50
++                    onTriggered: if (root.isActiveScreen && !root.authenticating)
++                        passwordInput.forceActiveFocus()
++                }
++
++                onAccepted: {
++                    if (passwordInput.text.trim() === "")
++                        return;
++
++                    // Guardar contraseña y limpiar campo inmediatamente
++                    authPasswordHolder.password = passwordInput.text;
++                    passwordInput.text = "";
++
++                    authenticating = true;
++                    errorMessage = "";
++                    pamAuth.start();
++                }
++            }
++
++            // Hint (el placeholder nativo lo oculta el estilo de Controls al enfocar)
++            Text {
++                id: hintText
++                anchors.centerIn: passwordInput
++                visible: passwordInput.text.length === 0 && !authenticating
++                text: usernameCollector.text.trim() !== "" ? usernameCollector.text.trim() : "Contraseña"
++                font.family: "Roboto"
++                font.weight: Font.Normal
++                font.pixelSize: 15
++                font.letterSpacing: 2
++                color: Qt.rgba(1, 1, 1, 0.5)
++                antialiasing: true
++            }
++
++            // Flecha / spinner
++            Text {
++                id: authIcon
++                anchors.verticalCenter: parent.verticalCenter
++                anchors.right: parent.right
++                anchors.rightMargin: 18
++                text: authenticating ? Icons.circleNotch : Icons.arrowRight
++                font.family: Icons.font
++                font.pixelSize: 16
++                color: Qt.rgba(1, 1, 1, 0.95)
++                opacity: authenticating ? 0.9 : (passwordInput.text.length > 0 ? 0.9 : 0.4)
+ 
+                 Behavior on opacity {
+                     enabled: Config.animDuration > 0
+                     NumberAnimation {
+-                        duration: Config.animDuration * 2
+-                        easing.type: Easing.OutExpo
++                        duration: Config.animDuration
++                        easing.type: Easing.OutQuad
+                     }
+                 }
+ 
+-                Behavior on slideOffset {
+-                    enabled: Config.animDuration > 0
+-                    NumberAnimation {
+-                        duration: Config.animDuration * 2
+-                        easing.type: Easing.OutExpo
++                Timer {
++                    interval: 90
++                    repeat: true
++                    running: authenticating
++                    onTriggered: authIcon.rotation = (authIcon.rotation + 45) % 360
++                }
++
++                onTextChanged: {
++                    if (authIcon.text !== Icons.circleNotch)
++                        authIcon.rotation = 0;
++                }
++
++                MouseArea {
++                    anchors.fill: parent
++                    anchors.margins: -12
++                    cursorShape: Qt.PointingHandCursor
++                    enabled: !authenticating
++                    onClicked: passwordInput.accepted()
++                }
++            }
++
++            SequentialAnimation {
++                id: wrongPasswordAnim
++                ScriptAction {
++                    script: {
++                        passwordInputBox.showError = true;
++                    }
++                }
++                NumberAnimation {
++                    target: passwordInputBox
++                    property: "shakeOffset"
++                    to: 8
++                    duration: 50
++                    easing.type: Easing.InOutQuad
++                }
++                NumberAnimation {
++                    target: passwordInputBox
++                    property: "shakeOffset"
++                    to: -8
++                    duration: 100
++                    easing.type: Easing.InOutQuad
++                }
++                NumberAnimation {
++                    target: passwordInputBox
++                    property: "shakeOffset"
++                    to: 8
++                    duration: 100
++                    easing.type: Easing.InOutQuad
++                }
++                NumberAnimation {
++                    target: passwordInputBox
++                    property: "shakeOffset"
++                    to: 0
++                    duration: 50
++                    easing.type: Easing.InOutQuad
++                }
++                ScriptAction {
++                    script: {
++                        passwordInput.text = "";
++                        authenticating = false;
++                        passwordInputBox.showError = false;
+                     }
+                 }
+             }
+         }
+ 
+-        Timer {
+-            interval: 1000
+-            running: true
+-            repeat: true
+-            onTriggered: clockContainer.currentTime = new Date()
++        Item {
++            width: 1
++            height: 16
++        }
++
++        // Estado: contraseña incorrecta / faillock
++        Text {
++            id: statusText
++            anchors.horizontalCenter: parent.horizontalCenter
++            visible: root.isActiveScreen
++            text: failLockSecondsLeft > 0 ? `BLOQUEADO · ${failLockSecondsLeft}s` : (errorMessage !== "" ? "CONTRASEÑA INCORRECTA" : "")
++            font.family: "Roboto"
++            font.weight: Font.Medium
++            font.pixelSize: 12
++            font.letterSpacing: 3
++            color: Colors.error
++            opacity: statusText.text !== "" ? 0.85 : 0
++            antialiasing: true
++
++            layer.enabled: true
++            layer.effect: BgShadow {}
++
++            Behavior on opacity {
++                enabled: Config.animDuration > 0
++                NumberAnimation {
++                    duration: Config.animDuration
++                    easing.type: Easing.OutQuad
++                }
++            }
+         }
+     }
+ 
+-    // Music player (slides from left)
++    // Reproductor minimal (abajo, centrado)
+     Item {
+         id: playerContainer
+         z: 10
+ 
+-        property bool isTopPosition: Config.lockscreen.position === "top"
++        readonly property var player: MprisController.activePlayer
++        readonly property string trackTitle: playerContainer.player?.trackTitle ?? ""
++        readonly property string trackArtist: playerContainer.player?.trackArtist ?? ""
++        readonly property string artUrl: playerContainer.player?.trackArtUrl ?? ""
++        readonly property real trackPosition: playerContainer.player?.position ?? 0
++        readonly property real trackLength: playerContainer.player?.length ?? 0
++
++        // mpris no empuja la posición: hay que pedirla (mismo truco que LockPlayer)
++        Timer {
++            interval: 1000
++            repeat: true
++            running: playerContainer.visible && !root.idle && MprisController.isPlaying
++            onTriggered: MprisController.activePlayer?.positionChanged()
++        }
++
++        visible: playerContainer.trackTitle !== ""
+ 
+         anchors {
+-            left: parent.left
+-            leftMargin: startAnim ? 32 : -(playerContainer.width + 64)
+-            top: isTopPosition ? parent.top : undefined
+-            topMargin: isTopPosition ? 32 : 0
+-            bottom: !isTopPosition ? parent.bottom : undefined
+-            bottomMargin: !isTopPosition ? 32 : 0
++            horizontalCenter: parent.horizontalCenter
++            bottom: parent.bottom
++            bottomMargin: startAnim ? 56 : -(playerContainer.height + 48)
+         }
+-        width: 350
+-        height: playerContent.height
++        width: playerRow.width
++        height: 44
+ 
+-        opacity: startAnim ? 1 : 0
++        opacity: startAnim && !root.idle ? 1 : 0
+ 
+-        Behavior on anchors.leftMargin {
++        Behavior on anchors.bottomMargin {
+             enabled: Config.animDuration > 0
+             NumberAnimation {
+-                duration: Config.animDuration * 2
++                duration: Config.animDuration * 3
+                 easing.type: Easing.OutExpo
+             }
+         }
+@@ -313,44 +713,263 @@
+             }
+         }
+ 
+-        LockPlayer {
+-            id: playerContent
+-            width: parent.width
++        Row {
++            id: playerRow
++            anchors.verticalCenter: parent.verticalCenter
++            spacing: 14
++
++            // Carátula
++            ClippingRectangle {
++                id: artContainer
++                width: 44
++                height: 44
++                radius: 22
++                color: Qt.rgba(1, 1, 1, 0.08)
++                anchors.verticalCenter: parent.verticalCenter
++                opacity: MprisController.isPlaying ? 1 : 0.45
++
++                Behavior on opacity {
++                    enabled: Config.animDuration > 0
++                    NumberAnimation {
++                        duration: Config.animDuration
++                        easing.type: Easing.OutQuad
++                    }
++                }
++
++                Image {
++                    anchors.fill: parent
++                    source: playerContainer.artUrl
++                    fillMode: Image.PreserveAspectCrop
++                    asynchronous: true
++                    mipmap: true
++                    visible: status === Image.Ready
++                }
++
++                Text {
++                    anchors.centerIn: parent
++                    visible: playerContainer.artUrl === ""
++                    text: Icons.player
++                    font.family: Icons.font
++                    font.pixelSize: 18
++                    color: Qt.rgba(1, 1, 1, 0.7)
++                }
++            }
++
++            // Título y artista
++            Column {
++                anchors.verticalCenter: parent.verticalCenter
++                spacing: 1
++
++                Text {
++                    text: playerContainer.trackTitle
++                    width: Math.min(implicitWidth, 320)
++                    elide: Text.ElideRight
++                    font.family: "Roboto"
++                    font.weight: Font.Medium
++                    font.pixelSize: 14
++                    color: Qt.rgba(1, 1, 1, 0.92)
++                    antialiasing: true
++                }
++
++                Item {
++                    width: 1
++                    height: 6
++                }
++
++                Rectangle {
++                    width: 220
++                    height: 2
++                    radius: 1
++                    color: Qt.rgba(1, 1, 1, 0.18)
++                    visible: playerContainer.trackLength > 0
++
++                    Rectangle {
++                        width: parent.width * Math.max(0, Math.min(1, playerContainer.trackPosition / Math.max(1, playerContainer.trackLength)))
++                        height: parent.height
++                        radius: parent.radius
++                        color: Qt.rgba(1, 1, 1, 0.6)
++                    }
++                }
++
++                Item {
++                    width: 1
++                    height: 4
++                }
++
++                Text {
++                    text: playerContainer.trackArtist
++                    width: Math.min(implicitWidth, 320)
++                    elide: Text.ElideRight
++                    visible: playerContainer.trackArtist !== ""
++                    font.family: "Roboto"
++                    font.pixelSize: 13
++                    font.letterSpacing: 0.5
++                    color: Qt.rgba(1, 1, 1, 0.55)
++                    antialiasing: true
++                }
++            }
++        }
++
++        layer.enabled: true
++        layer.effect: BgShadow {}
++
++        // Click = play/pausa
++        MouseArea {
++            anchors.fill: parent
++            anchors.margins: -8
++            cursorShape: Qt.PointingHandCursor
++            enabled: MprisController.canTogglePlaying
++            onClicked: MprisController.togglePlaying()
+         }
+     }
+ 
+-    // Password input container (slides from top or bottom)
+-    Item {
+-        id: passwordContainer
++    // Acciones de energía (abajo a la derecha)
++    Row {
++        id: powerActions
+         z: 10
+-
+-        property bool isTopPosition: Config.lockscreen.position === "top"
++        visible: root.isActiveScreen
+ 
+         anchors {
+-            horizontalCenter: parent.horizontalCenter
+-            top: isTopPosition ? parent.top : undefined
+-            topMargin: isTopPosition ? (startAnim ? 32 : -80) : 0
+-            bottom: !isTopPosition ? parent.bottom : undefined
+-            bottomMargin: !isTopPosition ? (startAnim ? 32 : -80) : 0
++            right: parent.right
++            bottom: parent.bottom
++            rightMargin: 40
++            bottomMargin: 36
+         }
+-        width: 350
+-        height: 96
++        spacing: 10
+ 
+-        opacity: startAnim ? 1 : 0
+-        scale: startAnim ? 1 : 0.92
++        opacity: startAnim && !root.idle ? 1 : 0
++
++        property int armed: -1
++        property string hint: ""
+ 
+-        Behavior on anchors.topMargin {
++        Behavior on opacity {
+             enabled: Config.animDuration > 0
+             NumberAnimation {
+                 duration: Config.animDuration * 2
+-                easing.type: Easing.OutExpo
++                easing.type: Easing.OutQuad
+             }
+         }
+ 
+-        Behavior on anchors.bottomMargin {
++        Timer {
++            id: disarmTimer
++            interval: 3000
++            onTriggered: powerActions.armed = -1
++        }
++
++        Text {
++            anchors.verticalCenter: parent.verticalCenter
++            text: powerActions.armed >= 0 ? "TOCÁ DE NUEVO PARA APAGAR" : powerActions.hint
++            visible: text !== ""
++            font.family: "Roboto"
++            font.weight: Font.Medium
++            font.pixelSize: 11
++            font.letterSpacing: 3
++            color: powerActions.armed >= 0 ? Colors.error : Qt.rgba(1, 1, 1, 0.7)
++            antialiasing: true
++
++            layer.enabled: true
++            layer.effect: BgShadow {}
++        }
++
++        Repeater {
++            model: [
++                {
++                    icon: Icons.moon,
++                    cmd: "systemctl suspend",
++                    label: "SUSPENDER",
++                    confirm: false
++                },
++                {
++                    icon: Icons.shutdown,
++                    cmd: "systemctl poweroff",
++                    label: "APAGAR",
++                    confirm: true
++                }
++            ]
++
++            delegate: Item {
++                id: powerBtn
++                required property var modelData
++                required property int index
++
++                width: 32
++                height: 32
++
++                Text {
++                    anchors.centerIn: parent
++                    text: powerBtn.modelData.icon
++                    font.family: Icons.font
++                    font.pixelSize: 18
++                    color: powerActions.armed === powerBtn.index ? Colors.error : Qt.rgba(1, 1, 1, 0.95)
++                    opacity: btnArea.containsMouse || powerActions.armed === powerBtn.index ? 1 : 0.4
++
++                    Behavior on opacity {
++                        enabled: Config.animDuration > 0
++                        NumberAnimation {
++                            duration: Config.animDuration
++                            easing.type: Easing.OutQuad
++                        }
++                    }
++
++                    layer.enabled: true
++                    layer.effect: BgShadow {}
++                }
++
++                MouseArea {
++                    id: btnArea
++                    anchors.fill: parent
++                    hoverEnabled: true
++                    cursorShape: Qt.PointingHandCursor
++
++                    onEntered: {
++                        root.wake();
++                        powerActions.hint = powerBtn.modelData.label;
++                    }
++                    onExited: {
++                        if (powerActions.hint === powerBtn.modelData.label)
++                            powerActions.hint = "";
++                    }
++                    onClicked: {
++                        // Apagar pide confirmación: un click suelto en la pantalla
++                        // de bloqueo no debería tumbar la sesión
++                        if (powerBtn.modelData.confirm && powerActions.armed !== powerBtn.index) {
++                            powerActions.armed = powerBtn.index;
++                            disarmTimer.restart();
++                            return;
++                        }
++                        disarmTimer.stop();
++                        powerActions.armed = -1;
++                        root.runPower(powerBtn.modelData.cmd);
++                    }
++                }
++            }
++        }
++    }
++
++    // Notificaciones (arriba a la izquierda) - las 4 más recientes
++    Column {
++        id: notifPanel
++        z: 10
++        visible: Notifications.list.length > 0
++        width: 330
++        spacing: 8
++
++        // ponytail: solo las últimas 4, sin scroll. El conteo total ya va bajo la fecha.
++        readonly property var items: Notifications.list.slice(-4).reverse()
++
++        anchors {
++            left: parent.left
++            top: parent.top
++            leftMargin: startAnim && root.showNotifs ? 44 : -(notifPanel.width + 48)
++            topMargin: 36
++        }
++
++        opacity: startAnim && !root.idle && root.showNotifs ? 1 : 0
++
++        Behavior on anchors.leftMargin {
+             enabled: Config.animDuration > 0
+             NumberAnimation {
+-                duration: Config.animDuration * 2
++                duration: Config.animDuration * 3
+                 easing.type: Easing.OutExpo
+             }
+         }
+@@ -363,227 +982,179 @@
+             }
+         }
+ 
+-        Behavior on scale {
+-            enabled: Config.animDuration > 0
+-            NumberAnimation {
+-                duration: Config.animDuration * 2
+-                easing.type: Easing.OutBack
+-                easing.overshoot: 1.2
++        Repeater {
++            model: notifPanel.items
++
++            delegate: Rectangle {
++                id: notifCard
++                required property var modelData
++
++                width: notifPanel.width
++                height: notifBody.implicitHeight + 26
++                radius: 16
++                color: Qt.rgba(0, 0, 0, 0.32)
++                border.width: 1
++                border.color: notifCard.modelData.urgency === "critical" ? Qt.rgba(1, 1, 1, 0.3) : Qt.rgba(1, 1, 1, 0.14)
++
++                Column {
++                    id: notifBody
++                    anchors.left: parent.left
++                    anchors.right: parent.right
++                    anchors.verticalCenter: parent.verticalCenter
++                    anchors.leftMargin: 16
++                    anchors.rightMargin: 16
++                    spacing: 3
++
++                    Text {
++                        width: parent.width
++                        text: (notifCard.modelData.appName || "SISTEMA").toUpperCase()
++                        font.family: "Roboto"
++                        font.weight: Font.Medium
++                        font.pixelSize: 10
++                        font.letterSpacing: 2
++                        color: Colors.primaryFixedDim
++                        elide: Text.ElideRight
++                        antialiasing: true
++                    }
++
++                    Text {
++                        width: parent.width
++                        visible: text !== ""
++                        text: notifCard.modelData.summary || ""
++                        font.family: "Roboto"
++                        font.weight: Font.Medium
++                        font.pixelSize: 13
++                        color: Qt.rgba(1, 1, 1, 0.95)
++                        elide: Text.ElideRight
++                        antialiasing: true
++                    }
++
++                    Text {
++                        width: parent.width
++                        visible: text !== ""
++                        text: notifCard.modelData.body || ""
++                        font.family: "Roboto"
++                        font.pixelSize: 12
++                        color: Qt.rgba(1, 1, 1, 0.6)
++                        wrapMode: Text.WordWrap
++                        maximumLineCount: 2
++                        elide: Text.ElideRight
++                        antialiasing: true
++                    }
++                }
+             }
+         }
+ 
+-        // Password input with avatar
+-        StyledRect {
+-            id: passwordInputBox
+-            variant: "bg"
+-            anchors.centerIn: parent
+-            width: parent.width
+-            height: 96
+-            radius: Config.roundness > 0 ? (height / 2) * (Config.roundness / 16) : 0
++        layer.enabled: true
++        layer.effect: BgShadow {}
++    }
+ 
+-            property real shakeOffset: 0
+-            property bool showError: false
++    // Batería (arriba a la derecha)
++    Row {
++        id: batteryIndicator
++        z: 10
++        visible: Battery.available
+ 
+-            transform: Translate {
+-                x: passwordInputBox.shakeOffset
++        anchors {
++            right: parent.right
++            top: parent.top
++            rightMargin: 44
++            topMargin: 36
++        }
++        spacing: 7
++
++        opacity: startAnim && !root.idle ? 0.6 : 0
++
++        Behavior on opacity {
++            enabled: Config.animDuration > 0
++            NumberAnimation {
++                duration: Config.animDuration * 2
++                easing.type: Easing.OutQuad
+             }
++        }
+ 
+-            Row {
+-                anchors.fill: parent
+-                anchors.leftMargin: 16
+-                anchors.rightMargin: 24
+-                spacing: 12
++        Text {
++            anchors.verticalCenter: parent.verticalCenter
++            text: {
++                if (Battery.isCharging)
++                    return Icons.batteryCharging;
++                const p = Battery.percentage;
++                if (p > 80)
++                    return Icons.batteryFull;
++                if (p > 55)
++                    return Icons.batteryHigh;
++                if (p > 30)
++                    return Icons.batteryMedium;
++                if (p > 12)
++                    return Icons.batteryLow;
++                return Icons.batteryEmpty;
++            }
++            font.family: Icons.font
++            font.pixelSize: 16
++            color: Qt.rgba(1, 1, 1, 0.95)
++        }
++
++        Text {
++            anchors.verticalCenter: parent.verticalCenter
++            text: Math.round(Battery.percentage) + "%"
++            font.family: "Roboto"
++            font.weight: Font.Medium
++            font.pixelSize: 13
++            font.letterSpacing: 2
++            color: Qt.rgba(1, 1, 1, 0.95)
++            antialiasing: true
++        }
+ 
+-                // Avatar (64x64)
+-                Rectangle {
+-                    id: avatarContainer
+-                    width: 64
+-                    height: 64
+-                    radius: Config.roundness > 0 ? (height / 2) * (Config.roundness / 16) : 0
+-                    color: "transparent"
+-                    anchors.verticalCenter: parent.verticalCenter
++        layer.enabled: true
++        layer.effect: BgShadow {}
++    }
+ 
+-                    Image {
+-                        mipmap: true
+-                        id: userAvatar
+-                        anchors.fill: parent
+-                        source: `file://${Quickshell.env("HOME")}/.face.icon`
+-                        fillMode: Image.PreserveAspectCrop
+-                        smooth: true
+-                        asynchronous: true
+-                        visible: status === Image.Ready
+-
+-                        layer.enabled: true
+-                        layer.effect: MultiEffect {
+-                            maskEnabled: true
+-                            maskThresholdMin: 0.5
+-                            maskSpreadAtMin: 1.0
+-                            maskSource: ShaderEffectSource {
+-                                sourceItem: Rectangle {
+-                                    width: userAvatar.width
+-                                    height: userAvatar.height
+-                                    radius: Config.roundness > 0 ? (height / 2) * (Config.roundness / 16) : 0
+-                                }
+-                            }
+-                        }
+-                    }
++    Process {
++        id: powerProc
++        running: false
++    }
+ 
+-                    // Fallback icon if image not found
+-                    Text {
+-                        anchors.centerIn: parent
+-                        text: "👤"
+-                        font.pixelSize: 32
+-                        visible: userAvatar.status !== Image.Ready
+-                    }
+-                }
++    // Reposo: a los 20s sin actividad se apaga todo menos el reloj
++    Timer {
++        id: idleTimer
++        interval: 20000
++        running: true
++        repeat: false
++        onTriggered: root.idle = true
++    }
+ 
+-                // Password field
+-                StyledRect {
+-                    id: passwordFieldBg
+-                    width: parent.width - avatarContainer.width - parent.spacing
+-                    height: 48
+-                    anchors.verticalCenter: parent.verticalCenter
+-                    variant: passwordInputBox.showError ? "error" : "common"
+-                    radius: Config.roundness > 0 ? (height / 2) * (Config.roundness / 16) : 0
++    // Mover el mouse despierta (debajo del contenido para no robarle el hover)
++    MouseArea {
++        anchors.fill: parent
++        z: 1
++        hoverEnabled: true
++        acceptedButtons: Qt.NoButton
++        onPositionChanged: root.wake()
++    }
+ 
+-                    RowLayout {
+-                        anchors.fill: parent
+-                        anchors.leftMargin: 16
+-                        anchors.rightMargin: 32
+-                        spacing: 8
+-
+-                        // User icon / Spinner
+-                        Text {
+-                            id: userIcon
+-                            text: authenticating ? Icons.circleNotch : Icons.user
+-                            font.family: Icons.font
+-                            font.pixelSize: 24
+-                            color: passwordFieldBg.item
+-                            Layout.preferredWidth: 24
+-                            Layout.preferredHeight: 24
+-                            Layout.alignment: Qt.AlignVCenter
+-                            z: 10
+-                            rotation: 0
+-
+-                            Behavior on color {
+-                                enabled: Config.animDuration > 0
+-                                ColorAnimation {
+-                                    duration: Config.animDuration
+-                                    easing.type: Easing.OutCubic
+-                                }
+-                            }
+-
+-                            Timer {
+-                                id: spinnerTimer
+-                                interval: 100
+-                                repeat: true
+-                                running: authenticating
+-                                onTriggered: {
+-                                    userIcon.rotation = (userIcon.rotation + 45) % 360;
+-                                }
+-                            }
+-
+-                            onTextChanged: {
+-                                if (userIcon.text === Icons.user) {
+-                                    userIcon.rotation = 0;
+-                                }
+-                            }
+-                        }
++    // Estado de Bloq Mayús (los LEDs de sysfs lo reflejan para cualquier teclado)
++    Process {
++        id: capsCheck
++        command: ["bash", "-c", "grep -q 1 /sys/class/leds/*::capslock/brightness 2>/dev/null && echo 1 || echo 0"]
++        running: false
+ 
+-                        // Text field
+-                        TextField {
+-                            id: passwordInput
+-                            Layout.fillWidth: true
+-                            Layout.alignment: Qt.AlignVCenter
+-                            placeholderText: usernameCollector.text.trim()
+-                            placeholderTextColor: Qt.rgba(passwordFieldBg.item.r, passwordFieldBg.item.g, passwordFieldBg.item.b, 0.5)
+-                            font.family: Config.theme.font
+-                            font.pixelSize: Styling.fontSize(0)
+-                            color: passwordFieldBg.item
+-                            background: null
+-                            echoMode: TextInput.Password
+-                            verticalAlignment: TextInput.AlignVCenter
+-                            enabled: !authenticating
+-
+-                            Behavior on color {
+-                                enabled: Config.animDuration > 0
+-                                ColorAnimation {
+-                                    duration: Config.animDuration
+-                                    easing.type: Easing.OutCubic
+-                                }
+-                            }
+-
+-                            Behavior on placeholderTextColor {
+-                                enabled: Config.animDuration > 0
+-                                ColorAnimation {
+-                                    duration: Config.animDuration
+-                                    easing.type: Easing.OutQuad
+-                                }
+-                            }
+-
+-                            onAccepted: {
+-                                if (passwordInput.text.trim() === "")
+-                                    return;
+-
+-                                // Guardar contraseña y limpiar campo inmediatamente
+-                                authPasswordHolder.password = passwordInput.text;
+-                                passwordInput.text = "";
+-
+-                                authenticating = true;
+-                                errorMessage = "";
+-                                pamAuth.start();
+-                            }
+-                        }
+-                    }
+-                }
+-            }
++        stdout: StdioCollector {
++            id: capsCollector
+ 
+-            SequentialAnimation {
+-                id: wrongPasswordAnim
+-                ScriptAction {
+-                    script: {
+-                        passwordInputBox.showError = true;
+-                    }
+-                }
+-                NumberAnimation {
+-                    target: passwordInputBox
+-                    property: "shakeOffset"
+-                    to: 10
+-                    duration: 50
+-                    easing.type: Easing.InOutQuad
+-                }
+-                NumberAnimation {
+-                    target: passwordInputBox
+-                    property: "shakeOffset"
+-                    to: -10
+-                    duration: 100
+-                    easing.type: Easing.InOutQuad
+-                }
+-                NumberAnimation {
+-                    target: passwordInputBox
+-                    property: "shakeOffset"
+-                    to: 10
+-                    duration: 100
+-                    easing.type: Easing.InOutQuad
+-                }
+-                NumberAnimation {
+-                    target: passwordInputBox
+-                    property: "shakeOffset"
+-                    to: 0
+-                    duration: 50
+-                    easing.type: Easing.InOutQuad
+-                }
+-                ScriptAction {
+-                    script: {
+-                        passwordInput.text = "";
+-                        authenticating = false;
+-                        passwordInputBox.showError = false;
+-                    }
+-                }
++            onStreamFinished: {
++                root.capsLockOn = text.trim() === "1";
+             }
+         }
+     }
+ 
++    Timer {
++        interval: 600
++        running: !root.idle
++        repeat: true
++        triggeredOnStart: true
++        onTriggered: capsCheck.running = true
++    }
++
+     // Timer to unlock after exit animation
+     Timer {
+         id: unlockTimer
+@@ -694,6 +1265,8 @@
+                 // Error de autenticación
+                 errorMessage = "Authentication failed";
+                 console.warn("PAM auth failed with result:", result);
++                // Sin esto el contador de faillock nunca se llena
++                failLockCheck.running = true;
+                 if (Config.animDuration > 0) {
+                     wrongPasswordAnim.start();
+                 }
+@@ -738,6 +1311,32 @@
+         z: 100
+     }
+ 
++    // ponytail: receptor por defecto del teclado. Si nadie tiene el foco, la primera
++    // tecla no se pierde: enfoca el campo y la escribe. Solo actúa cuando el TextField
++    // no consumió el evento. Techo: appende al final, no respeta el cursor.
++    Item {
++        anchors.fill: parent
++        z: 0
++        focus: true
++
++        Keys.onPressed: event => {
++            root.wake();
++            if (root.authenticating)
++                return;
++            root.typedHere = true;
++            passwordInput.forceActiveFocus();
++            if (event.key === Qt.Key_Backspace)
++                passwordInput.text = passwordInput.text.slice(0, -1);
++            else if (event.key === Qt.Key_Escape)
++                passwordInput.text = "";
++            else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
++                passwordInput.accepted();
++            else if (event.text.length === 1 && event.text.charCodeAt(0) >= 0x20)
++                passwordInput.insert(passwordInput.length, event.text);
++            event.accepted = true;
++        }
++    }
++
+     // Initialize when component is created (when lock becomes active)
+     Component.onCompleted: {
+         // Capture screen immediately
+@@ -745,6 +1344,8 @@
+ 
+         // Start animations
+         startAnim = true;
+-        passwordInput.forceActiveFocus();
++        failLockCheck.running = true;
++        if (root.isActiveScreen)
++            passwordInput.forceActiveFocus();
+     }
+ }
